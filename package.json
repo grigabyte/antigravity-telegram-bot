@@ -1,0 +1,21 @@
+{
+  "name": "neuro-copilot-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod",
+    "set-webhook": "node scripts/set-webhook.js",
+    "summarize": "node scripts/summarize-chat.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vercel": "^39.0.0"
+  }
+}
