@@ -195,9 +195,7 @@ antigravity-telegram-bot/
 │   └── webhook.ts           # ALL bot logic (single-file architecture)
 ├── scripts/
 │   ├── set-webhook.js       # Telegram webhook configuration
-│   ├── setup-supabase.sql   # Database schema
-│   ├── import-ai-studio.ts  # Import history from Google AI Studio
-│   └── reimport-clean.ts    # Clean reimport without thinking blocks
+│   └── setup-supabase.sql   # Database schema
 ├── .env.example             # Environment variables template
 ├── vercel.json              # Vercel configuration (300s timeout)
 ├── tsconfig.json            # TypeScript configuration

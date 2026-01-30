@@ -322,8 +322,7 @@ antigravity-telegram-bot/
 │   └── webhook.ts           # All bot logic (~1600 lines)
 ├── scripts/
 │   ├── set-webhook.js       # Telegram webhook setup
-│   ├── setup-supabase.sql   # Database schema
-│   └── import-ai-studio.ts  # Import from AI Studio
+│   └── setup-supabase.sql   # Database schema
 ├── .env.example             # Environment template
 ├── vercel.json              # Vercel config (300s timeout)
 ├── tsconfig.json            # TypeScript config
