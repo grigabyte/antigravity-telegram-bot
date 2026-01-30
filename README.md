@@ -459,8 +459,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ElevenLabs](https://elevenlabs.io) — Text-to-speech
 - [Telegram Bot API](https://core.telegram.org/bots/api) — Messaging platform
 
----
 
-<p align="center">
-  Made with AI
-</p>
