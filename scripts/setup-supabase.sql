@@ -1,7 +1,7 @@
 -- Neuro Copilot Bot - Supabase Schema
--- Run this in Supabase SQL Editor
+-- Run this in Supabase SQL Editor (supabase.com > SQL Editor)
 
--- История чата (поддержка 1M+ токенов)
+-- Chat history (supports 1M+ tokens)
 CREATE TABLE IF NOT EXISTS chat_history (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS chat_history (
 CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_history_timestamp ON chat_history(user_id, timestamp DESC);
 
--- Долгосрочная память
+-- Long-term memory (facts, preferences, goals)
 CREATE TABLE IF NOT EXISTS long_term_memory (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS long_term_memory (
 CREATE INDEX IF NOT EXISTS idx_memory_user ON long_term_memory(user_id);
 CREATE INDEX IF NOT EXISTS idx_memory_type ON long_term_memory(user_id, type);
 
--- Настройки пользователя
+-- User settings
 CREATE TABLE IF NOT EXISTS user_settings (
   user_id BIGINT PRIMARY KEY,
   insights TEXT DEFAULT '',
@@ -40,27 +40,34 @@ CREATE TABLE IF NOT EXISTS user_settings (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Сжатые саммари (для старых сообщений)
+-- Compressed summaries (for old messages)
 CREATE TABLE IF NOT EXISTS chat_summaries (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL,
   summary TEXT NOT NULL,
-  message_range_start BIGINT NOT NULL,
-  message_range_end BIGINT NOT NULL,
-  original_token_count INT NOT NULL,
+  messages_compressed INT NOT NULL DEFAULT 0,
+  message_range_start BIGINT,
+  message_range_end BIGINT,
+  original_token_count INT,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_summaries_user ON chat_summaries(user_id);
 
--- Последние источники поиска
+-- Last search sources
 CREATE TABLE IF NOT EXISTS last_sources (
   user_id BIGINT PRIMARY KEY,
   sources JSONB NOT NULL DEFAULT '[]',
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- RLS (Row Level Security) - опционально
+-- Optional: Enable Row Level Security for multi-user setup
 -- ALTER TABLE chat_history ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE long_term_memory ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE user_settings ENABLE ROW LEVEL SECURITY;
+-- ALTER TABLE chat_summaries ENABLE ROW LEVEL SECURITY;
+-- ALTER TABLE last_sources ENABLE ROW LEVEL SECURITY;
+
+-- Optional: Create RLS policies
+-- CREATE POLICY "Users can only access their own data" ON chat_history
+--   FOR ALL USING (auth.uid()::text = user_id::text);

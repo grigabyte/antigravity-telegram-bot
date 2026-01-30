@@ -13,14 +13,14 @@
 ## Features
 
 ### AI & Context
-- **Gemini 3 Pro** — Google's most capable model via Antigravity API
+- **Gemini 3 Pro** — Google's most capable model via Antigravity OAuth
 - **1M+ token context** — remembers entire conversation history
 - **Smart compression** — automatically summarizes old messages at 800K tokens
 - **Long-term memory** — extracts and stores facts, preferences, goals
-- **Google Search** — real-time information from the web
+- **Google Search** — real-time web search integration
 
 ### Media Processing
-- **Voice messages** — transcription via native Gemini
+- **Voice messages** — native Gemini transcription
 - **Video & video notes** — analysis and transcription
 - **Audio files** — MP3, WAV, FLAC, M4A support
 - **Images** — vision analysis
@@ -33,6 +33,8 @@
 - **TTS responses** — text-to-speech via ElevenLabs
 - **Export/Import** — full data backup and restore
 - **Inline keyboard** — quick action buttons
+
+---
 
 ## Commands
 
@@ -52,6 +54,8 @@
 | `/clearmemory` | Clear long-term memory |
 | `/voice <text>` | Get voice response (TTS) |
 
+---
+
 ## Tech Stack
 
 | Component | Technology |
@@ -66,72 +70,123 @@
 
 ## Deployment Guide
 
-### Prerequisites
+### What You'll Need
 
-- Node.js 18+
-- [Vercel](https://vercel.com) account (free tier works)
-- [Supabase](https://supabase.com) account (free tier works)
-- Telegram Bot Token from [@BotFather](https://t.me/BotFather)
-- [Antigravity](https://antigravity.ai) account with OAuth credentials
-- [ElevenLabs](https://elevenlabs.io) account (optional, for TTS)
+Before starting, make sure you have:
+
+1. **Node.js 18+** installed on your machine
+2. **Telegram account** to create a bot
+3. **Antigravity account** with OAuth credentials (from [antigravity.ai](https://antigravity.ai))
+4. **Supabase account** (free tier) for database
+5. **Vercel account** (free tier) for hosting
+6. **ElevenLabs account** (optional, free tier) for voice responses
 
 ---
 
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/grigabyte/neuro-copilot-bot.git
-cd neuro-copilot-bot
+git clone https://github.com/grigabyte/antigravity-telegram-bot.git
+cd antigravity-telegram-bot
 npm install
 ```
 
 ---
 
-### Step 2: Create Telegram Bot
+### Step 2: Create a Telegram Bot
 
-1. Open [@BotFather](https://t.me/BotFather) in Telegram
-2. Send `/newbot` and follow instructions
-3. Copy the bot token (looks like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`)
-4. (Optional) Get your Telegram User ID from [@userinfobot](https://t.me/userinfobot) to restrict bot access
+1. Open Telegram and find [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`
+3. Choose a name (e.g., "My Neuro Copilot")
+4. Choose a username (must end with `bot`, e.g., `my_neuro_copilot_bot`)
+5. **Save the token** - it looks like: `7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+
+**Optional**: Get your Telegram User ID to make the bot private:
+1. Message [@userinfobot](https://t.me/userinfobot)
+2. It will reply with your user ID (a number like `123456789`)
 
 ---
 
 ### Step 3: Set Up Supabase Database
 
-1. Create a new project at [supabase.com](https://supabase.com)
-2. Go to **SQL Editor**
-3. Run the contents of `scripts/setup-supabase.sql`
-4. Go to **Settings > API** and copy:
-   - **Project URL** (e.g., `https://xxxxx.supabase.co`)
-   - **Service Role Key** (secret, starts with `eyJ...`)
+1. Go to [supabase.com](https://supabase.com) and create a free account
+2. Click **New Project** and fill in the details
+3. Wait for the project to be created (1-2 minutes)
+4. Go to **SQL Editor** in the left sidebar
+5. Paste and run this SQL:
+
+```sql
+-- Create tables for the bot
+CREATE TABLE chat_history (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'model')),
+  content TEXT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  is_compressed BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE long_term_memory (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('fact', 'preference', 'goal')),
+  content TEXT NOT NULL,
+  confidence REAL DEFAULT 1.0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE user_settings (
+  user_id BIGINT PRIMARY KEY,
+  insights TEXT DEFAULT '',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE last_sources (
+  user_id BIGINT PRIMARY KEY,
+  sources JSONB NOT NULL DEFAULT '[]',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE chat_summaries (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  summary TEXT NOT NULL,
+  messages_compressed INT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Add indexes for better performance
+CREATE INDEX idx_chat_history_user_id ON chat_history(user_id);
+CREATE INDEX idx_chat_history_timestamp ON chat_history(timestamp);
+CREATE INDEX idx_long_term_memory_user_id ON long_term_memory(user_id);
+CREATE INDEX idx_chat_summaries_user_id ON chat_summaries(user_id);
+```
+
+6. Go to **Settings > API** and copy:
+   - **Project URL** (looks like `https://abcdefg.supabase.co`)
+   - **service_role key** (secret key, starts with `eyJ...`)
 
 ---
 
 ### Step 4: Get Antigravity OAuth Credentials
 
-> **Important:** This bot uses Antigravity API with OAuth authentication, NOT Google Cloud API keys.
+> **Important**: This bot uses Antigravity OAuth to access Gemini 3 Pro. This is NOT the same as Google Cloud API keys.
 
-#### What you need from Antigravity:
+1. Go to [antigravity.ai](https://antigravity.ai) and sign up/login
+2. Create or select a project
+3. Complete the OAuth authorization flow
+4. You will receive these credentials:
 
-| Credential | Description |
-|------------|-------------|
-| `CLIENT_ID` | OAuth Client ID (ends with `.apps.googleusercontent.com`) |
-| `CLIENT_SECRET` | OAuth Client Secret (starts with `GOCSPX-`) |
-| `REFRESH_TOKEN` | OAuth Refresh Token for your account |
-| `EMAIL` | Your Google account email |
-| `PROJECT_ID` | Your Antigravity project ID |
+| Credential | Example Format | Description |
+|------------|----------------|-------------|
+| Client ID | `1234567890-abc.apps.googleusercontent.com` | OAuth app identifier |
+| Client Secret | `GOCSPX-AbCdEfGhIjKlMnOpQrStUvWxYz` | OAuth app secret |
+| Email | `your.email@gmail.com` | Your Google account |
+| Refresh Token | `1//0abcdefghijklmnop...` | Long-lived auth token |
+| Project ID | `my-project-abc123` | Your Antigravity project |
 
-#### How to get these credentials:
-
-1. Sign up at [antigravity.ai](https://antigravity.ai)
-2. Create a new project
-3. Follow the OAuth setup flow to authorize your Google account
-4. The platform will provide you with:
-   - Client ID and Client Secret (shared OAuth app credentials)
-   - Refresh Token (generated during authorization)
-   - Project ID (visible in your dashboard)
-
-> **Note:** The refresh token is long-lived and allows the bot to make API calls on your behalf. Keep it secret!
+**Save all of these** - you'll need them in Step 6.
 
 ---
 
@@ -139,71 +194,91 @@ npm install
 
 For text-to-speech voice responses:
 
-1. Sign up at [elevenlabs.io](https://elevenlabs.io)
-2. Go to **Profile > API Keys**
-3. Create and copy your API key
-4. Choose a voice ID (default: `iP95p4xoKVk53GoZ742B` — Chris)
+1. Go to [elevenlabs.io](https://elevenlabs.io) and create a free account
+2. Click your profile icon → **Profile + API key**
+3. Click **Create API Key** and copy it
+4. The default voice is "Chris" with ID `iP95p4xoKVk53GoZ742B`
+
+Free tier includes 10,000 characters/month.
 
 ---
 
 ### Step 6: Deploy to Vercel
 
-#### Option A: Deploy via CLI
+#### Option A: Using Vercel CLI (Recommended)
 
 ```bash
-# Install Vercel CLI
-npm i -g vercel
+# Install Vercel CLI globally
+npm install -g vercel
 
-# Login and link project
+# Login to Vercel
 vercel login
+
+# Link project (follow prompts)
 vercel link
+```
 
-# Add environment variables
-vercel env add TELEGRAM_BOT_TOKEN production
-vercel env add ADMIN_USER_ID production          # Optional
-vercel env add SUPABASE_URL production
-vercel env add SUPABASE_KEY production
-vercel env add ANTIGRAVITY_CLIENT_ID production
-vercel env add ANTIGRAVITY_CLIENT_SECRET production
-vercel env add ANTIGRAVITY_EMAIL production
-vercel env add ANTIGRAVITY_REFRESH_TOKEN production
-vercel env add ANTIGRAVITY_PROJECT_ID production
-vercel env add ELEVENLABS_API_KEY production     # Optional
-vercel env add ELEVENLABS_VOICE_ID production    # Optional
+Now add environment variables. **Important**: Use `echo -n` to avoid trailing newlines!
 
-# Deploy
+```bash
+# Required variables
+echo -n 'YOUR_TELEGRAM_BOT_TOKEN' | vercel env add TELEGRAM_BOT_TOKEN production
+echo -n 'YOUR_TELEGRAM_USER_ID' | vercel env add ADMIN_USER_ID production
+echo -n 'https://xxxxx.supabase.co' | vercel env add SUPABASE_URL production
+echo -n 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' | vercel env add SUPABASE_KEY production
+echo -n 'xxxxx.apps.googleusercontent.com' | vercel env add ANTIGRAVITY_CLIENT_ID production
+echo -n 'GOCSPX-xxxxx' | vercel env add ANTIGRAVITY_CLIENT_SECRET production
+echo -n 'your.email@gmail.com' | vercel env add ANTIGRAVITY_EMAIL production
+echo -n '1//xxxxx' | vercel env add ANTIGRAVITY_REFRESH_TOKEN production
+echo -n 'your-project-id' | vercel env add ANTIGRAVITY_PROJECT_ID production
+
+# Optional (for TTS)
+echo -n 'sk_xxxxx' | vercel env add ELEVENLABS_API_KEY production
+echo -n 'iP95p4xoKVk53GoZ742B' | vercel env add ELEVENLABS_VOICE_ID production
+```
+
+Deploy to production:
+
+```bash
 vercel --prod
 ```
 
-#### Option B: Deploy via Vercel Dashboard
+Note your deployment URL (e.g., `https://your-bot.vercel.app`).
 
-1. Import the repository at [vercel.com/new](https://vercel.com/new)
-2. Add environment variables in **Settings > Environment Variables**
-3. Deploy
+#### Option B: Using Vercel Dashboard
+
+1. Go to [vercel.com/new](https://vercel.com/new)
+2. Import the repository from GitHub
+3. Go to **Settings > Environment Variables**
+4. Add each variable from the table below
+5. Deploy
 
 ---
 
-### Step 7: Configure Webhook
+### Step 7: Set Up Telegram Webhook
 
-After deployment, set up the Telegram webhook:
+Tell Telegram where to send messages:
 
 ```bash
-# Using npm script
-VERCEL_URL=your-app.vercel.app npm run set-webhook
-
-# Or manually via curl
-curl "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-app.vercel.app/api/webhook"
+curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_URL>/api/webhook"
 ```
+
+Replace:
+- `<YOUR_BOT_TOKEN>` with your Telegram bot token
+- `<YOUR_VERCEL_URL>` with your Vercel deployment URL
+
+You should see: `{"ok":true,"result":true,"description":"Webhook was set"}`
 
 ---
 
 ### Step 8: Test Your Bot
 
-1. Open your bot in Telegram
+1. Open Telegram and find your bot by username
 2. Send `/start`
-3. Send a message and wait for response
+3. If everything is set up correctly, you'll see the command list
+4. Try sending a message!
 
-#### Verify deployment:
+#### Verify deployment health:
 
 ```bash
 curl https://your-app.vercel.app/api/webhook
@@ -226,7 +301,7 @@ Expected response:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
-| `ADMIN_USER_ID` | No | Your Telegram ID (restricts access to you only) |
+| `ADMIN_USER_ID` | No | Your Telegram ID (makes bot private) |
 | `SUPABASE_URL` | Yes | Supabase project URL |
 | `SUPABASE_KEY` | Yes | Supabase service role key |
 | `ANTIGRAVITY_CLIENT_ID` | Yes | Antigravity OAuth Client ID |
@@ -242,7 +317,7 @@ Expected response:
 ## Project Structure
 
 ```
-neuro-copilot-bot/
+antigravity-telegram-bot/
 ├── api/
 │   └── webhook.ts           # All bot logic (~1600 lines)
 ├── scripts/
@@ -253,9 +328,9 @@ neuro-copilot-bot/
 ├── vercel.json              # Vercel config (300s timeout)
 ├── tsconfig.json            # TypeScript config
 ├── package.json
-├── README.md
+├── README.md                # This file
 ├── AGENTS.md                # Technical docs for AI agents
-└── LICENSE
+└── LICENSE                  # MIT License
 ```
 
 ---
@@ -275,7 +350,7 @@ neuro-copilot-bot/
       │                     │
 ```
 
-1. Bot uses your `refresh_token` to get a short-lived `access_token`
+1. Bot uses your `refresh_token` to get a temporary `access_token`
 2. Access token is used to call Gemini 3 Pro API
 3. Tokens refresh automatically when expired
 
@@ -322,24 +397,29 @@ Bot automatically extracts user information:
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Bot doesn't respond | Check webhook: `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo` |
-| "Unauthorized" errors | Verify `ANTIGRAVITY_*` env vars are correct (no trailing spaces/newlines!) |
-| Rate limit (429) | Wait 1-5 minutes, Antigravity has quotas |
-| Timeout errors | Vercel has 300s limit, try shorter messages |
-| TTS not working | Check `ELEVENLABS_API_KEY` is set |
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Bot doesn't respond | Webhook not set | Run Step 7 again |
+| "Unauthorized" error | Env vars have newlines | Re-add with `echo -n` |
+| Rate limit (429) | API quota exceeded | Wait 1-5 minutes |
+| Timeout errors | Response takes >300s | Try shorter messages |
+| TTS not working | Missing API key | Add `ELEVENLABS_API_KEY` |
 
-### Verify Environment Variables
+### Check Webhook Status
 
-Make sure env vars have no trailing newlines:
 ```bash
-# Pull and check
-vercel env pull .env.check --environment=production
-cat .env.check | grep ANTIGRAVITY
+curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"
 ```
 
-Values should NOT end with `\n`.
+### Check Environment Variables
+
+Make sure values don't have trailing newlines:
+
+```bash
+vercel env pull .env.check --environment=production
+cat .env.check | grep ANTIGRAVITY_CLIENT_ID
+# Should NOT end with \n
+```
 
 ---
 
@@ -372,7 +452,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- [Antigravity](https://antigravity.ai) — Gemini API access
+- [Antigravity](https://antigravity.ai) — Gemini API access via OAuth
 - [Google Gemini](https://deepmind.google/technologies/gemini/) — AI model
 - [Vercel](https://vercel.com) — Serverless hosting
 - [Supabase](https://supabase.com) — PostgreSQL database
