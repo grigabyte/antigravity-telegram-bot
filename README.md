@@ -322,7 +322,8 @@ antigravity-telegram-bot/
 │   └── webhook.ts           # All bot logic (~1600 lines)
 ├── scripts/
 │   ├── set-webhook.js       # Telegram webhook setup
-│   └── setup-supabase.sql   # Database schema
+│   ├── setup-supabase.sql   # Database schema
+│   └── import-ai-studio.ts  # Import history from AI Studio
 ├── .env.example             # Environment template
 ├── vercel.json              # Vercel config (300s timeout)
 ├── tsconfig.json            # TypeScript config
@@ -331,6 +332,21 @@ antigravity-telegram-bot/
 ├── AGENTS.md                # Technical docs for AI agents
 └── LICENSE                  # MIT License
 ```
+
+### Import Chat History from AI Studio
+
+If you have chat history from Google AI Studio, you can import it:
+
+```bash
+# Set your Supabase credentials
+export SUPABASE_URL="https://xxx.supabase.co"
+export SUPABASE_KEY="your-service-role-key"
+
+# Run the import script (replace with your Telegram user ID and export path)
+npx ts-node scripts/import-ai-studio.ts 123456789 ~/Downloads/ai-studio-export.json
+```
+
+The script extracts actual model responses (skips thinking blocks) and imports them into Supabase.
 
 ---
 
