@@ -27,22 +27,22 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? parseInt(process.env.ADMIN_USE
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_KEY!;
 
-// Antigravity OAuth (set via environment variables)
-const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
-const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
+// Antigravity OAuth (get credentials from Antigravity)
+const CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID!;
+const CLIENT_SECRET = process.env.ANTIGRAVITY_CLIENT_SECRET!;
 
 // Antigravity API
 const ANTIGRAVITY_ENDPOINT = 'https://cloudcode-pa.googleapis.com/v1internal:generateContent';
 const GEMINI_MODEL = 'gemini-3-pro-preview';
 
-// Account (set via environment variables)
+// Account (your Antigravity account)
 const ACCOUNT = {
-  email: process.env.GOOGLE_EMAIL || '',
-  refreshToken: process.env.GOOGLE_REFRESH_TOKEN!,
-  projectId: process.env.GOOGLE_PROJECT_ID!
+  email: process.env.ANTIGRAVITY_EMAIL || '',
+  refreshToken: process.env.ANTIGRAVITY_REFRESH_TOKEN!,
+  projectId: process.env.ANTIGRAVITY_PROJECT_ID!
 };
 
-// ElevenLabs TTS (optional)
+// ElevenLabs TTS (optional - for voice responses)
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'iP95p4xoKVk53GoZ742B';
 
