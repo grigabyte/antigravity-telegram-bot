@@ -35,7 +35,7 @@ export async function setMessageReaction(
 
   if (!response.ok) {
     const text = await response.text();
-    console.warn('Failed to set reaction:', text.slice(0, 200));
+    throw new Error(`SET_REACTION_FAILED:${response.status}:${text.slice(0, 200)}`);
   }
 }
 
@@ -60,20 +60,29 @@ export async function applyDynamicReaction(
     return;
   }
 
-  await setMessageReaction(chatId, messageId, selected.emoji || '👍', selected.customEmojiId || undefined);
-  await saveReactionEvent(
-    userId,
-    chatId,
-    messageId,
-    selected.emoji,
-    selected.customEmojiId,
-    signal.intent
-  );
+  try {
+    await setMessageReaction(chatId, messageId, selected.emoji || '👍', selected.customEmojiId || undefined);
+    await saveReactionEvent(
+      userId,
+      chatId,
+      messageId,
+      selected.emoji,
+      selected.customEmojiId,
+      signal.intent
+    );
 
-  await saveMetric(userId, 'reaction_sent', 1, {
-    intent: signal.intent,
-    confidence: signal.confidence,
-    emoji: selected.emoji,
-    customEmojiId: selected.customEmojiId,
-  });
+    await saveMetric(userId, 'reaction_sent', 1, {
+      intent: signal.intent,
+      confidence: signal.confidence,
+      emoji: selected.emoji,
+      customEmojiId: selected.customEmojiId,
+    });
+  } catch (error) {
+    await saveMetric(userId, 'reaction_skipped', 1, {
+      reason: 'send_failed',
+      intent: signal.intent,
+      confidence: signal.confidence,
+      error: error instanceof Error ? error.message.slice(0, 180) : String(error).slice(0, 180),
+    });
+  }
 }

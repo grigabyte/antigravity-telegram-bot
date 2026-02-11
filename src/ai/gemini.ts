@@ -7,7 +7,7 @@ import {
   REQUEST_TIMEOUTS,
 } from '../config.js';
 import { fetchWithTimeout } from '../network/fetch.js';
-import type { GeminiMessage, GeminiResponse } from '../types.js';
+import type { GeminiMessage, GeminiRequestPayload, GeminiResponse } from '../types.js';
 
 interface CachedToken {
   accessToken: string;
@@ -71,15 +71,13 @@ export async function callGemini(options: CallGeminiOptions): Promise<GeminiResu
     try {
       const accessToken = await getAccessToken();
 
-      const requestPayload: any = {
+      const requestPayload: GeminiRequestPayload = {
         contents: messages,
         generationConfig: {
           temperature: 0.9,
           maxOutputTokens: 65536,
         },
-        tools: [{
-          googleSearch: {},
-        }],
+        tools: [{ googleSearch: {} }],
       };
 
       let finalSystemPrompt = systemPrompt || '';

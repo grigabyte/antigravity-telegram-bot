@@ -1,14 +1,62 @@
 import { ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, REQUEST_TIMEOUTS, TELEGRAM_API_BASE } from '../config.js';
 import { fetchWithTimeout } from '../network/fetch.js';
+import type { TelegramInlineKeyboardMarkup } from '../types.js';
 import { convertToTelegramHtml, splitTelegramHtml } from './formatting.js';
 import { getReplyKeyboard } from './keyboards.js';
+
+interface TelegramSendMessageBody {
+  chat_id: number;
+  text: string;
+  parse_mode?: 'HTML';
+  reply_to_message_id?: number;
+  reply_markup?: TelegramInlineKeyboardMarkup | ReturnType<typeof getReplyKeyboard>;
+}
+
+interface TelegramApiResult {
+  ok: boolean;
+  description: string;
+}
+
+async function parseTelegramResponse(response: Response): Promise<TelegramApiResult> {
+  const text = await response.text();
+
+  let description = text.slice(0, 220);
+  try {
+    const payload = text ? JSON.parse(text) as Record<string, unknown> : null;
+    if (payload && typeof payload === 'object') {
+      const okValue = payload.ok;
+      const payloadDescription = typeof payload.description === 'string' ? payload.description : '';
+      if (okValue === true) {
+        return { ok: true, description: payloadDescription };
+      }
+      if (okValue === false) {
+        return { ok: false, description: payloadDescription || description };
+      }
+    }
+  } catch {
+    // ignore non-json bodies
+  }
+
+  if (!response.ok) {
+    description = `${response.status}: ${description}`;
+    return { ok: false, description };
+  }
+
+  return { ok: true, description };
+}
+
+async function ensureTelegramOk(response: Response, operation: string): Promise<void> {
+  const parsed = await parseTelegramResponse(response);
+  if (parsed.ok) return;
+  throw new Error(`${operation}_FAILED:${parsed.description}`);
+}
 
 export async function sendTelegram(
   chatId: number,
   text: string,
   replyTo?: number,
   showKeyboard: boolean = false,
-  inlineKeyboard?: any
+  inlineKeyboard?: TelegramInlineKeyboardMarkup
 ): Promise<void> {
   const formattedText = convertToTelegramHtml(text);
   const chunks = splitTelegramHtml(formattedText, 3900);
@@ -17,12 +65,12 @@ export async function sendTelegram(
     const chunk = chunks[i];
     const isLastChunk = i === chunks.length - 1;
 
-      const body: any = {
-        chat_id: chatId,
-        text: chunk,
-        parse_mode: 'HTML',
-        reply_to_message_id: i === 0 ? replyTo : undefined,
-      };
+    const body: TelegramSendMessageBody = {
+      chat_id: chatId,
+      text: chunk,
+      parse_mode: 'HTML',
+      reply_to_message_id: i === 0 ? replyTo : undefined,
+    };
 
     if (isLastChunk) {
       if (inlineKeyboard) {
@@ -42,9 +90,10 @@ export async function sendTelegram(
       REQUEST_TIMEOUTS.telegram
     );
 
-    if (!response.ok) {
+    const primary = await parseTelegramResponse(response);
+    if (!primary.ok) {
       const plainText = chunk.replace(/<[^>]+>/g, '');
-      const fallbackBody: any = {
+      const fallbackBody: TelegramSendMessageBody = {
         chat_id: chatId,
         text: plainText,
         reply_to_message_id: i === 0 ? replyTo : undefined,
@@ -56,7 +105,7 @@ export async function sendTelegram(
           fallbackBody.reply_markup = getReplyKeyboard();
         }
       }
-      await fetchWithTimeout(
+      const fallbackResponse = await fetchWithTimeout(
         `${TELEGRAM_API_BASE}/sendMessage`,
         {
           method: 'POST',
@@ -65,12 +114,13 @@ export async function sendTelegram(
         },
         REQUEST_TIMEOUTS.telegram
       );
+      await ensureTelegramOk(fallbackResponse, 'SEND_MESSAGE_FALLBACK');
     }
   }
 }
 
 export async function answerCallback(callbackId: string, text?: string): Promise<void> {
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/answerCallbackQuery`,
     {
       method: 'POST',
@@ -79,10 +129,11 @@ export async function answerCallback(callbackId: string, text?: string): Promise
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'ANSWER_CALLBACK');
 }
 
 export async function editMessage(chatId: number, messageId: number, text: string): Promise<void> {
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/editMessageText`,
     {
       method: 'POST',
@@ -96,6 +147,7 @@ export async function editMessage(chatId: number, messageId: number, text: strin
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'EDIT_MESSAGE');
 }
 
 export async function sendVoice(chatId: number, audioBuffer: Buffer, replyToMessageId?: number): Promise<void> {
@@ -106,7 +158,7 @@ export async function sendVoice(chatId: number, audioBuffer: Buffer, replyToMess
     formData.append('reply_to_message_id', replyToMessageId.toString());
   }
 
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/sendVoice`,
     {
       method: 'POST',
@@ -114,6 +166,7 @@ export async function sendVoice(chatId: number, audioBuffer: Buffer, replyToMess
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'SEND_VOICE');
 }
 
 export async function sendDocument(
@@ -130,7 +183,7 @@ export async function sendDocument(
     formData.append('caption', caption);
   }
 
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/sendDocument`,
     {
       method: 'POST',
@@ -138,10 +191,11 @@ export async function sendDocument(
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'SEND_DOCUMENT');
 }
 
 export async function sendAnimation(chatId: number, animationFileId: string, replyToMessageId?: number): Promise<void> {
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/sendAnimation`,
     {
       method: 'POST',
@@ -154,10 +208,11 @@ export async function sendAnimation(chatId: number, animationFileId: string, rep
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'SEND_ANIMATION');
 }
 
 export async function sendTyping(chatId: number): Promise<void> {
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/sendChatAction`,
     {
       method: 'POST',
@@ -166,11 +221,18 @@ export async function sendTyping(chatId: number): Promise<void> {
     },
     REQUEST_TIMEOUTS.telegram
   );
+  await ensureTelegramOk(response, 'SEND_TYPING');
 }
 
 export function startTypingLoop(chatId: number): NodeJS.Timeout {
-  sendTyping(chatId);
-  return setInterval(() => sendTyping(chatId), 4000);
+  void sendTyping(chatId).catch((error) => {
+    console.warn('Failed to send typing action:', String(error).slice(0, 180));
+  });
+  return setInterval(() => {
+    void sendTyping(chatId).catch((error) => {
+      console.warn('Failed to send typing action:', String(error).slice(0, 180));
+    });
+  }, 4000);
 }
 
 export async function textToSpeech(text: string): Promise<Buffer | null> {

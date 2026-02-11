@@ -10,6 +10,21 @@ import { fetchWithTimeout } from '../network/fetch.js';
 import { downloadFile } from '../telegram/files.js';
 import type { SignalClassification } from '../types.js';
 
+interface CandidatePart {
+  text?: string;
+  thoughtSignature?: boolean;
+}
+
+interface CandidateContainer {
+  response?: {
+    candidates?: Array<{
+      content?: {
+        parts?: CandidatePart[];
+      };
+    }>;
+  };
+}
+
 function normalize(text: string): string {
   return text.trim().toLowerCase();
 }
@@ -112,6 +127,13 @@ function normalizeSignalForOutput(raw: Partial<SignalClassification>, fallback: 
   };
 }
 
+function extractTextFromCandidateContainer(data: CandidateContainer): string {
+  const parts = data?.response?.candidates?.[0]?.content?.parts || [];
+  const direct = parts.find((part) => typeof part.text === 'string' && !part.thoughtSignature)?.text;
+  if (direct) return direct;
+  return parts.find((part) => typeof part.text === 'string')?.text || '';
+}
+
 async function classifyVisualSignalWithLlm(
   kind: 'sticker' | 'gif',
   fileId: string,
@@ -180,11 +202,8 @@ async function classifyVisualSignalWithLlm(
       return fallback;
     }
 
-    const data = await response.json();
-    const text =
-      data?.response?.candidates?.[0]?.content?.parts?.find((part: any) => part.text && !part.thoughtSignature)?.text ||
-      data?.response?.candidates?.[0]?.content?.parts?.find((part: any) => part.text)?.text ||
-      '';
+    const data = await response.json() as CandidateContainer;
+    const text = extractTextFromCandidateContainer(data);
 
     const parsed = JSON.parse(text.replace(/```json|```/gi, '').trim());
     return normalizeSignalForOutput(parsed, fallback);

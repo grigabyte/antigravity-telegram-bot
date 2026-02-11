@@ -198,13 +198,29 @@ CREATE TABLE IF NOT EXISTS proactive_jobs (
   job_type TEXT NOT NULL,
   due_at BIGINT NOT NULL,
   payload JSONB NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'cancelled')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'sent', 'cancelled')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   sent_at TIMESTAMPTZ
 );
 
+ALTER TABLE proactive_jobs
+  ADD COLUMN IF NOT EXISTS lease_token TEXT;
+
+ALTER TABLE proactive_jobs
+  ADD COLUMN IF NOT EXISTS leased_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_proactive_jobs_due
   ON proactive_jobs(status, due_at);
+
+CREATE TABLE IF NOT EXISTS processed_updates (
+  id BIGSERIAL PRIMARY KEY,
+  update_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  update_type TEXT NOT NULL,
+  processed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(update_id, user_id, chat_id, update_type)
+);
 ```
 
 8. (Advanced, recommended for semantic signals + dynamic reactions/stickers/GIF + RAG):
@@ -274,6 +290,8 @@ Now add environment variables. **Important**: Use `echo -n` to avoid trailing ne
 ```bash
 # Required variables
 echo -n 'YOUR_TELEGRAM_BOT_TOKEN' | vercel env add TELEGRAM_BOT_TOKEN production
+echo -n 'YOUR_RANDOM_WEBHOOK_SECRET' | vercel env add TELEGRAM_WEBHOOK_SECRET production
+echo -n 'YOUR_RANDOM_CRON_SECRET' | vercel env add PROACTIVE_CRON_SECRET production
 echo -n 'YOUR_TELEGRAM_USER_ID' | vercel env add ADMIN_USER_ID production
 echo -n 'https://xxxxx.supabase.co' | vercel env add SUPABASE_URL production
 echo -n 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' | vercel env add SUPABASE_KEY production
@@ -317,7 +335,7 @@ curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://<YOUR_
 Better: use the helper script (includes callback queries + reactions in `allowed_updates`):
 
 ```bash
-VERCEL_URL=your-app.vercel.app TELEGRAM_BOT_TOKEN=your-token npm run set-webhook
+VERCEL_URL=your-app.vercel.app TELEGRAM_BOT_TOKEN=your-token TELEGRAM_WEBHOOK_SECRET=your-secret npm run set-webhook
 ```
 
 Replace:
@@ -346,8 +364,9 @@ Expected response:
 {
   "status": "ok",
   "bot": "neuro-copilot",
-  "version": "8.3",
-  "model": "gemini-3-pro-preview"
+  "version": "8.6",
+  "model": "gemini-3-pro-preview",
+  "schema": "ready"
 }
 ```
 
@@ -358,6 +377,8 @@ Expected response:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | Bot token from @BotFather |
+| `TELEGRAM_WEBHOOK_SECRET` | Yes (production) | Secret token for Telegram webhook header validation |
+| `PROACTIVE_CRON_SECRET` | Yes (production) | Secret for authorized access to `/api/proactive` |
 | `ADMIN_USER_ID` | No | Your Telegram ID (makes bot private) |
 | `SUPABASE_URL` | Yes | Supabase project URL |
 | `SUPABASE_KEY` | Yes | Supabase service role key |
@@ -387,6 +408,12 @@ Expected response:
 - `MEMORY_RETRIEVAL_MODE=supabase`: lexical retrieval from Supabase history/signals (no embeddings API cost).
 
 Both modes are compatible with the same data model. You can switch between them without destructive migration.
+
+### Security notes (production)
+
+- Set `TELEGRAM_WEBHOOK_SECRET` and configure webhook with the same value.
+- Set `PROACTIVE_CRON_SECRET` and send it to `/api/proactive` as `Authorization: Bearer <secret>` (or `x-cron-secret`).
+- Do not deploy without these secrets in production.
 
 ---
 

@@ -4,6 +4,8 @@ import {
   OPENROUTER_API_KEY,
   OPENROUTER_EMBEDDING_MODEL_FALLBACK,
   OPENROUTER_EMBEDDING_MODEL_PRIMARY,
+  MEMORY_RETRIEVAL_MODE,
+  NODE_ENV,
   REQUEST_TIMEOUTS,
 } from '../config.js';
 import { fetchWithTimeout } from '../network/fetch.js';
@@ -90,6 +92,10 @@ export async function embedText(text: string): Promise<number[]> {
 
   const fallback = await requestOpenRouterEmbedding(OPENROUTER_EMBEDDING_MODEL_FALLBACK, trimmed).catch(() => null);
   if (fallback) return fallback;
+
+  if (MEMORY_RETRIEVAL_MODE === 'rag' && NODE_ENV === 'production') {
+    throw new Error('EMBEDDINGS_UNAVAILABLE');
+  }
 
   return resizeVector(fakeEmbedText(trimmed, OPENROUTER_EMBEDDING_DIM), OPENROUTER_EMBEDDING_DIM);
 }

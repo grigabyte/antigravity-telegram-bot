@@ -1,7 +1,11 @@
 export const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-export const ADMIN_USER_ID = process.env.ADMIN_USER_ID ? parseInt(process.env.ADMIN_USER_ID) : null;
+const ADMIN_USER_ID_RAW = process.env.ADMIN_USER_ID;
+const ADMIN_USER_ID_PARSED = ADMIN_USER_ID_RAW ? Number.parseInt(ADMIN_USER_ID_RAW, 10) : null;
+export const ADMIN_USER_ID = Number.isFinite(ADMIN_USER_ID_PARSED) ? ADMIN_USER_ID_PARSED : null;
 export const SUPABASE_URL = process.env.SUPABASE_URL!;
 export const SUPABASE_KEY = process.env.SUPABASE_KEY!;
+export const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+export const PROACTIVE_CRON_SECRET = process.env.PROACTIVE_CRON_SECRET || process.env.CRON_SECRET || '';
 
 export const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
@@ -31,6 +35,7 @@ export const OPENROUTER_EMBEDDING_DIM = process.env.OPENROUTER_EMBEDDING_DIM
 export const MEMORY_RETRIEVAL_MODE = (process.env.MEMORY_RETRIEVAL_MODE || 'rag').toLowerCase();
 export const SIGNAL_CLASSIFIER_MODE = (process.env.SIGNAL_CLASSIFIER_MODE || 'hybrid').toLowerCase();
 export const OUTBOUND_SIGNAL_POLICY_MODE = (process.env.OUTBOUND_SIGNAL_POLICY_MODE || 'llm').toLowerCase();
+export const NODE_ENV = (process.env.NODE_ENV || 'development').toLowerCase();
 
 export const TELEGRAM_REACTION_MIN_INTERVAL_MS = process.env.TELEGRAM_REACTION_MIN_INTERVAL_MS
   ? Number.parseInt(process.env.TELEGRAM_REACTION_MIN_INTERVAL_MS, 10)
@@ -65,3 +70,12 @@ export const BATCHING = {
   maxBatchWindowMs: 45000,
   pendingLimit: 50,
 };
+
+export const DEFAULT_STICKERS = {
+  celebrate: process.env.TELEGRAM_STICKER_CELEBRATE || '',
+  support: process.env.TELEGRAM_STICKER_SUPPORT || '',
+};
+
+if (process.env.ADMIN_USER_ID && ADMIN_USER_ID === null) {
+  console.warn('ADMIN_USER_ID is invalid and will be ignored. Expected numeric Telegram user id.');
+}

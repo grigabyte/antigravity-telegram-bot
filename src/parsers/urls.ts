@@ -1,6 +1,32 @@
 import { REQUEST_TIMEOUTS } from '../config.js';
 import { fetchWithTimeout } from '../network/fetch.js';
-import { isAllowedUrl } from '../security/url-guard.js';
+import { isAllowedUrl, isAllowedUrlForFetch } from '../security/url-guard.js';
+
+const MAX_URL_CONTENT_BYTES = 2 * 1024 * 1024;
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function stripHtmlToText(html: string): string {
+  return decodeHtmlEntities(
+    html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
+}
 
 export function extractUrls(text: string): string[] {
   const urlRegex = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/gi;
@@ -41,8 +67,13 @@ export async function fetchYouTubeMetadata(url: string): Promise<string> {
   }
 }
 
-export async function fetchUrlContent(url: string): Promise<string> {
+export async function fetchUrlContent(url: string, depth: number = 0): Promise<string> {
   if (!isAllowedUrl(url)) {
+    return `[Ссылка недоступна для загрузки: ${url}]`;
+  }
+
+  const allowedForFetch = await isAllowedUrlForFetch(url);
+  if (!allowedForFetch) {
     return `[Ссылка недоступна для загрузки: ${url}]`;
   }
 
@@ -58,10 +89,39 @@ export async function fetchUrlContent(url: string): Promise<string> {
           'User-Agent': 'Mozilla/5.0 (compatible; NeuroCopilotBot/1.0)',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-        redirect: 'follow',
+        redirect: 'manual',
       },
       REQUEST_TIMEOUTS.urlFetch
     );
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location') || '';
+      if (!location) {
+        return `[Не удалось загрузить ${url}: redirect без location]`;
+      }
+
+      let redirectedUrl = '';
+      try {
+        redirectedUrl = new URL(location, url).toString();
+      } catch {
+        return `[Не удалось загрузить ${url}: некорректный redirect]`;
+      }
+
+      if (!isAllowedUrl(redirectedUrl)) {
+        return `[Redirect заблокирован политикой безопасности: ${redirectedUrl}]`;
+      }
+
+      const redirectedAllowedForFetch = await isAllowedUrlForFetch(redirectedUrl);
+      if (!redirectedAllowedForFetch) {
+        return `[Redirect заблокирован политикой безопасности: ${redirectedUrl}]`;
+      }
+
+      if (depth >= 3) {
+        return `[Не удалось загрузить ${url}: слишком много redirect]`;
+      }
+
+      return fetchUrlContent(redirectedUrl, depth + 1);
+    }
 
     if (!response.ok) {
       return `[Не удалось загрузить ${url}: ${response.status}]`;
@@ -72,30 +132,26 @@ export async function fetchUrlContent(url: string): Promise<string> {
       return `[${url} — не текстовый контент: ${contentType}]`;
     }
 
-    const html = await response.text();
+    const contentLengthHeader = response.headers.get('content-length');
+    const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : 0;
+    if (Number.isFinite(contentLength) && contentLength > MAX_URL_CONTENT_BYTES) {
+      return `[${url} — контент слишком большой]`;
+    }
 
-    let text = html
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
-      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
-      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/\s+/g, ' ')
-      .trim();
+    const html = await response.text();
+    if (html.length > MAX_URL_CONTENT_BYTES) {
+      return `[${url} — контент слишком большой]`;
+    }
+
+    let text = stripHtmlToText(html);
 
     if (text.length > 15000) {
       text = text.substring(0, 15000) + '... [обрезано]';
     }
 
     return `[Содержимое ${url}]:\n${text}`;
-  } catch (error: any) {
-    return `[Ошибка загрузки ${url}: ${error.message}]`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown_error';
+    return `[Ошибка загрузки ${url}: ${message}]`;
   }
 }

@@ -1,4 +1,4 @@
-import { REQUEST_TIMEOUTS, TELEGRAM_API_BASE } from '../config.js';
+import { DEFAULT_STICKERS, REQUEST_TIMEOUTS, TELEGRAM_API_BASE } from '../config.js';
 import { fetchWithTimeout } from '../network/fetch.js';
 import {
   getGifCatalog,
@@ -13,11 +13,6 @@ import { pickGifFromCatalog, pickStickerFromCatalog } from '../decision/catalog-
 import type { SignalClassification, SignalPolicyDecision } from '../types.js';
 import { sendAnimation } from './client.js';
 
-const DEFAULT_STICKERS = {
-  celebrate: process.env.TELEGRAM_STICKER_CELEBRATE || '',
-  support: process.env.TELEGRAM_STICKER_SUPPORT || '',
-};
-
 export async function sendSticker(
   chatId: number,
   stickerId: string,
@@ -25,7 +20,7 @@ export async function sendSticker(
 ): Promise<void> {
   if (!stickerId) return;
 
-  await fetchWithTimeout(
+  const response = await fetchWithTimeout(
     `${TELEGRAM_API_BASE}/sendSticker`,
     {
       method: 'POST',
@@ -38,6 +33,11 @@ export async function sendSticker(
     },
     REQUEST_TIMEOUTS.telegram
   );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`SEND_STICKER_FAILED:${response.status}:${errorText.slice(0, 220)}`);
+  }
 }
 
 export async function applyDynamicStickerOrGif(
@@ -55,35 +55,81 @@ export async function applyDynamicStickerOrGif(
 
   const selectedSticker = pickStickerFromCatalog(signal, stickerCatalog, lastStickerEvent);
   if (selectedSticker) {
-    await sendSticker(chatId, selectedSticker.fileId, messageId);
-    await saveStickerEvent(userId, chatId, messageId, selectedSticker.fileId, signal.intent);
-    await saveMetric(userId, 'sticker_sent', 1, {
-      intent: signal.intent,
-      confidence: signal.confidence,
-      fileId: selectedSticker.fileId,
-    });
+    try {
+      await sendSticker(chatId, selectedSticker.fileId, messageId);
+      await saveStickerEvent(userId, chatId, messageId, selectedSticker.fileId, signal.intent);
+      await saveMetric(userId, 'sticker_sent', 1, {
+        intent: signal.intent,
+        confidence: signal.confidence,
+        fileId: selectedSticker.fileId,
+      });
+    } catch (error) {
+      await saveMetric(userId, 'sticker_gif_skipped', 1, {
+        reason: 'sticker_send_failed',
+        intent: signal.intent,
+        confidence: signal.confidence,
+        error: error instanceof Error ? error.message.slice(0, 180) : String(error).slice(0, 180),
+      });
+    }
     return;
   }
 
   const selectedGif = pickGifFromCatalog(signal, gifCatalog, lastGifEvent);
   if (selectedGif) {
-    await sendAnimation(chatId, selectedGif.fileId, messageId);
-    await saveGifEvent(userId, chatId, messageId, selectedGif.fileId, signal.intent);
-    await saveMetric(userId, 'gif_sent', 1, {
-      intent: signal.intent,
-      confidence: signal.confidence,
-      fileId: selectedGif.fileId,
-    });
+    try {
+      await sendAnimation(chatId, selectedGif.fileId, messageId);
+      await saveGifEvent(userId, chatId, messageId, selectedGif.fileId, signal.intent);
+      await saveMetric(userId, 'gif_sent', 1, {
+        intent: signal.intent,
+        confidence: signal.confidence,
+        fileId: selectedGif.fileId,
+      });
+    } catch (error) {
+      await saveMetric(userId, 'sticker_gif_skipped', 1, {
+        reason: 'gif_send_failed',
+        intent: signal.intent,
+        confidence: signal.confidence,
+        error: error instanceof Error ? error.message.slice(0, 180) : String(error).slice(0, 180),
+      });
+    }
     return;
   }
 
   if (signal.intent === 'celebrate' && DEFAULT_STICKERS.celebrate) {
-    await sendSticker(chatId, DEFAULT_STICKERS.celebrate, messageId);
-    await saveMetric(userId, 'sticker_sent_fallback', 1, {
-      intent: signal.intent,
-      confidence: signal.confidence,
-      fileId: DEFAULT_STICKERS.celebrate,
-    });
+    try {
+      await sendSticker(chatId, DEFAULT_STICKERS.celebrate, messageId);
+      await saveMetric(userId, 'sticker_sent_fallback', 1, {
+        intent: signal.intent,
+        confidence: signal.confidence,
+        fileId: DEFAULT_STICKERS.celebrate,
+      });
+    } catch (error) {
+      await saveMetric(userId, 'sticker_gif_skipped', 1, {
+        reason: 'fallback_celebrate_send_failed',
+        intent: signal.intent,
+        confidence: signal.confidence,
+        error: error instanceof Error ? error.message.slice(0, 180) : String(error).slice(0, 180),
+      });
+    }
+    return;
+  }
+
+  if (signal.intent === 'support' && DEFAULT_STICKERS.support) {
+    try {
+      await sendSticker(chatId, DEFAULT_STICKERS.support, messageId);
+      await saveMetric(userId, 'sticker_sent_fallback', 1, {
+        intent: signal.intent,
+        confidence: signal.confidence,
+        fileId: DEFAULT_STICKERS.support,
+      });
+    } catch (error) {
+      await saveMetric(userId, 'sticker_gif_skipped', 1, {
+        reason: 'fallback_support_send_failed',
+        intent: signal.intent,
+        confidence: signal.confidence,
+        error: error instanceof Error ? error.message.slice(0, 180) : String(error).slice(0, 180),
+      });
+    }
     return;
   }
 

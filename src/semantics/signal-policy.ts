@@ -3,6 +3,21 @@ import { getAccessToken } from '../ai/gemini.js';
 import { fetchWithTimeout } from '../network/fetch.js';
 import type { SignalClassification, SignalPolicyDecision } from '../types.js';
 
+interface CandidatePart {
+  text?: string;
+  thoughtSignature?: boolean;
+}
+
+interface CandidateContainer {
+  response?: {
+    candidates?: Array<{
+      content?: {
+        parts?: CandidatePart[];
+      };
+    }>;
+  };
+}
+
 const DEFAULT_DECISION: SignalPolicyDecision = {
   kind: 'none',
   emotion: 'neutral',
@@ -38,6 +53,13 @@ function parseDecision(text: string): SignalPolicyDecision {
   } catch {
     return DEFAULT_DECISION;
   }
+}
+
+function extractPolicyText(data: CandidateContainer): string {
+  const parts = data?.response?.candidates?.[0]?.content?.parts || [];
+  const primary = parts.find((part) => typeof part.text === 'string' && !part.thoughtSignature)?.text;
+  if (primary) return primary;
+  return parts.find((part) => typeof part.text === 'string')?.text || '';
 }
 
 export async function inferOutboundSignalWithLlm(
@@ -110,11 +132,8 @@ ${JSON.stringify(fallbackSignal)}
     };
   }
 
-  const data = await response.json();
-  const rawText =
-    data?.response?.candidates?.[0]?.content?.parts?.find((part: any) => part.text && !part.thoughtSignature)?.text ||
-    data?.response?.candidates?.[0]?.content?.parts?.find((part: any) => part.text)?.text ||
-    '';
+  const data = await response.json() as CandidateContainer;
+  const rawText = extractPolicyText(data);
 
   const decision = parseDecision(rawText);
   if (decision.kind === 'none' && fallbackSignal.intent !== 'none' && fallbackSignal.confidence >= 0.7) {

@@ -21,16 +21,42 @@ CREATE TABLE IF NOT EXISTS proactive_jobs (
   job_type TEXT NOT NULL,
   due_at BIGINT NOT NULL,
   payload JSONB NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'cancelled')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'sent', 'cancelled')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   sent_at TIMESTAMPTZ
 );
+
+ALTER TABLE proactive_jobs
+  DROP CONSTRAINT IF EXISTS proactive_jobs_status_check;
+
+ALTER TABLE proactive_jobs
+  ADD CONSTRAINT proactive_jobs_status_check
+  CHECK (status IN ('pending', 'processing', 'sent', 'cancelled'));
+
+ALTER TABLE proactive_jobs
+  ADD COLUMN IF NOT EXISTS lease_token TEXT;
+
+ALTER TABLE proactive_jobs
+  ADD COLUMN IF NOT EXISTS leased_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_proactive_jobs_due
   ON proactive_jobs(status, due_at);
 
 CREATE INDEX IF NOT EXISTS idx_proactive_jobs_user
   ON proactive_jobs(user_id, status, due_at);
+
+CREATE TABLE IF NOT EXISTS processed_updates (
+  id BIGSERIAL PRIMARY KEY,
+  update_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  update_type TEXT NOT NULL,
+  processed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(update_id, user_id, chat_id, update_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_updates_processed_at
+  ON processed_updates(processed_at DESC);
 
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'ru-RU';

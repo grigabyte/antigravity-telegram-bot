@@ -8,6 +8,19 @@ export interface Part {
   inlineData?: { mimeType: string; data: string };
 }
 
+export interface GeminiRequestPayload {
+  contents: GeminiMessage[];
+  generationConfig: {
+    temperature: number;
+    maxOutputTokens: number;
+  };
+  tools?: Array<Record<string, unknown>>;
+  systemInstruction?: {
+    role: 'user';
+    parts: Array<{ text: string }>;
+  };
+}
+
 export interface ChatMessage {
   role: 'user' | 'model';
   content: string;
@@ -167,6 +180,16 @@ export interface CatalogGif {
   weight: number;
   enabled: boolean;
   cooldownSec: number;
+}
+
+export interface TelegramInlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export interface TelegramInlineKeyboardMarkup {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
 }
 
 export interface MemoryVectorHit {

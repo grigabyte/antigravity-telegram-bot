@@ -5,6 +5,7 @@
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const VERCEL_URL = process.env.VERCEL_URL;
+const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 if (!TELEGRAM_TOKEN) {
   console.error('Error: TELEGRAM_BOT_TOKEN is not set');
@@ -27,6 +28,7 @@ async function setWebhook() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       url: webhookUrl,
+      secret_token: WEBHOOK_SECRET || undefined,
       allowed_updates: [
         'message',
         'edited_message',

@@ -4,11 +4,13 @@ import {
   BATCHING,
   GEMINI_MODEL,
   MEMORY_RETRIEVAL_MODE,
+  NODE_ENV,
   OUTBOUND_SIGNAL_POLICY_MODE,
+  TELEGRAM_WEBHOOK_SECRET,
   MAX_CONTEXT_TOKENS,
   MAX_HISTORY_MESSAGES,
 } from '../config.js';
-import type { TelegramUpdate } from '../types.js';
+import type { SignalClassification, TelegramUpdate } from '../types.js';
 import { callGemini } from '../ai/gemini.js';
 import {
   addMemoryItem,
@@ -24,6 +26,10 @@ import {
   getLastSources,
   getLongTermMemory,
   getUserSettings,
+  isSchemaReady,
+  markUpdateProcessed,
+  replaceHistorySafely,
+  replaceLongTermMemorySafely,
   saveMessageSignal,
   setMemoryPinned,
   setUserQuietHours,
@@ -31,6 +37,7 @@ import {
   saveLastSources,
   saveMetric,
   saveUserSettings,
+  isSupabaseMissingRelationError,
 } from '../db/supabase.js';
 import {
   answerCallback,
@@ -55,11 +62,186 @@ import { applyDynamicReaction } from '../telegram/reactions.js';
 import { applyDynamicStickerOrGif } from '../telegram/stickers.js';
 import { hasPendingProactiveJob, scheduleProactiveMessage } from '../proactive/scheduler.js';
 import { buildTimeContext, normalizeTimezone, parseQuietHours } from '../time/clock.js';
-import { classifyReactionSignal, inferOutboundSignal } from '../semantics/signal-classifier.js';
+import { classifyReactionSignal, inferOutboundSignal, classifyGifSignal, classifyStickerSignal } from '../semantics/signal-classifier.js';
 import { inferOutboundSignalWithLlm } from '../semantics/signal-policy.js';
 import type { SignalPolicyDecision } from '../types.js';
 import { buildMemoryRagContext, ingestMemoryFromText } from '../memory/rag-memory.js';
 import { buildSupabaseMemoryContext } from '../memory/supabase-memory.js';
+
+function getWebhookSecretHeader(req: VercelRequest): string {
+  const rawHeader = req.headers['x-telegram-bot-api-secret-token'];
+  if (typeof rawHeader === 'string') return rawHeader.trim();
+  if (Array.isArray(rawHeader)) return (rawHeader[0] || '').trim();
+  return '';
+}
+
+function isWebhookAuthorized(req: VercelRequest): boolean {
+  const expected = TELEGRAM_WEBHOOK_SECRET.trim();
+  if (!expected) {
+    return NODE_ENV !== 'production';
+  }
+
+  const actual = getWebhookSecretHeader(req);
+  return actual === expected;
+}
+
+function isAllowedUser(userId: number): boolean {
+  if (!Number.isFinite(userId)) return false;
+  if (ADMIN_USER_ID === null) return true;
+  return userId === ADMIN_USER_ID;
+}
+
+function sanitizeForUserError(value: string): string {
+  return value
+    .replace(/[A-Za-z0-9_-]{20,}/g, '[скрыто]')
+    .replace(/https?:\/\/\S+/gi, '[url]');
+}
+
+function sanitizeForLog(value: string): string {
+  return sanitizeForUserError(value).slice(0, 400);
+}
+
+function isSchemaMissingError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message.includes('SCHEMA_MISSING:')) return true;
+  return isSupabaseMissingRelationError(error);
+}
+
+function isDuplicateUpdateError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes('duplicate key') || message.includes('23505');
+}
+
+function isTemporaryNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes('network') || message.includes('fetch failed') || message.includes('timeout');
+}
+
+function formatUserFacingError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return ERROR_MESSAGES.UNKNOWN;
+  }
+
+  const message = error.message || '';
+
+  if (message.includes('RATE_LIMIT') || message.includes('429')) {
+    return ERROR_MESSAGES.RATE_LIMIT;
+  }
+  if (message.includes('token') || message.includes('401')) {
+    return ERROR_MESSAGES.TOKEN_EXPIRED;
+  }
+  if (isTemporaryNetworkError(error)) {
+    return ERROR_MESSAGES.NETWORK_ERROR;
+  }
+  if (message.includes('timeout') || message.includes('TIMEOUT')) {
+    return ERROR_MESSAGES.TIMEOUT;
+  }
+  if (message.includes('too large') || message.includes('size')) {
+    return ERROR_MESSAGES.FILE_TOO_LARGE;
+  }
+  if (isSchemaMissingError(error)) {
+    return '⚠️ База данных не полностью настроена. Запусти SQL-миграции и попробуй снова.';
+  }
+
+  return '❌ Произошла внутренняя ошибка. Попробуй ещё раз чуть позже.';
+}
+
+function notifyErrorSafely(chatId: number, error: unknown): Promise<void> {
+  return sendTelegram(chatId, formatUserFacingError(error), undefined, true)
+    .catch((sendError) => {
+      console.error('Failed to send error message to user:', sanitizeForLog(String(sendError)));
+    });
+}
+
+function parseImportPayload(rawContent: string): {
+  history: Array<{ role: 'user' | 'model'; content: string; timestamp: number }>;
+  insights: string;
+  memory: { facts: string[]; preferences: string[]; goals: string[] };
+} {
+  const parsed = JSON.parse(rawContent) as unknown;
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('INVALID_IMPORT_PAYLOAD');
+  }
+
+  const payload = parsed as Record<string, unknown>;
+
+  const insightsRaw = payload.insights;
+  const insights = typeof insightsRaw === 'string' ? insightsRaw.slice(0, 4000) : '';
+
+  const historyRaw = Array.isArray(payload.history) ? payload.history : [];
+  const history = historyRaw
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const row = item as Record<string, unknown>;
+      const role = row.role;
+      const content = row.content;
+      const timestamp = row.timestamp;
+      if ((role !== 'user' && role !== 'model') || typeof content !== 'string' || !Number.isFinite(Number(timestamp))) {
+        return null;
+      }
+      const normalizedContent = content.trim();
+      if (!normalizedContent) return null;
+      return {
+        role,
+        content: normalizedContent.slice(0, 20000),
+        timestamp: Number(timestamp),
+      } as { role: 'user' | 'model'; content: string; timestamp: number };
+    })
+    .filter((item): item is { role: 'user' | 'model'; content: string; timestamp: number } => Boolean(item));
+
+  const memoryRaw = payload.memory;
+  const memoryRecord = memoryRaw && typeof memoryRaw === 'object'
+    ? (memoryRaw as Record<string, unknown>)
+    : {};
+
+  function pickList(key: 'facts' | 'preferences' | 'goals'): string[] {
+    const value = memoryRecord[key];
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => (typeof item === 'string' ? item.trim() : ''))
+      .filter((item) => item.length > 0)
+      .slice(0, 1000);
+  }
+
+  return {
+    history,
+    insights,
+    memory: {
+      facts: pickList('facts'),
+      preferences: pickList('preferences'),
+      goals: pickList('goals'),
+    },
+  };
+}
+
+async function persistSignalSafely(
+  userId: number,
+  chatId: number,
+  messageId: number,
+  signalType: 'sticker' | 'gif' | 'reaction',
+  signal: SignalClassification,
+  rawMeta: Record<string, unknown>
+): Promise<void> {
+  await saveMessageSignal(userId, chatId, messageId, signalType, signal, rawMeta);
+}
+
+async function saveMetricSafe(
+  userId: number,
+  metricName: string,
+  metricValue: number,
+  meta: Record<string, unknown> = {}
+): Promise<void> {
+  try {
+    await saveMetric(userId, metricName, metricValue, meta);
+  } catch (error) {
+    if (isDuplicateUpdateError(error)) {
+      throw error;
+    }
+    console.warn(`Failed to save metric ${metricName}:`, sanitizeForLog(String(error)));
+  }
+}
 
 const ERROR_MESSAGES: Record<string, string> = {
   RATE_LIMIT: '⏳ Квота API исчерпана. Попробуй через несколько минут.',
@@ -71,37 +253,17 @@ const ERROR_MESSAGES: Record<string, string> = {
   UNKNOWN: '❌ Произошла ошибка. Попробуй ещё раз.',
 };
 
-function formatError(error: unknown): string {
-  const maybeError = error as { message?: string };
-  const message = maybeError?.message || '';
-
-  if (message.includes('RATE_LIMIT') || message.includes('429')) {
-    return ERROR_MESSAGES.RATE_LIMIT;
-  }
-  if (message.includes('token') || message.includes('401')) {
-    return ERROR_MESSAGES.TOKEN_EXPIRED;
-  }
-  if (message.includes('fetch') || message.includes('network')) {
-    return ERROR_MESSAGES.NETWORK_ERROR;
-  }
-  if (message.includes('timeout') || message.includes('TIMEOUT')) {
-    return ERROR_MESSAGES.TIMEOUT;
-  }
-  if (message.includes('too large') || message.includes('size')) {
-    return ERROR_MESSAGES.FILE_TOO_LARGE;
-  }
-
-  return `❌ Ошибка: ${message.substring(0, 200)}`;
-}
-
 export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'GET') {
+    const schema = await isSchemaReady().catch(() => ({ ok: false, missing: ['schema_check_failed'] }));
     return res.status(200).json({
       status: 'ok',
       bot: 'neuro-copilot',
-      version: '8.3',
+      version: '8.6',
       model: GEMINI_MODEL,
       maxOutputTokens: 65536,
+      schema: schema.ok ? 'ready' : 'partial',
+      missingTables: schema.missing,
       features: [
         'voice',
         'video',
@@ -127,37 +289,83 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  if (!isWebhookAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
   const update: TelegramUpdate = req.body;
 
-  if (update.message_reaction) {
-    const reactionUserId = update.message_reaction.user?.id;
-    const reactionChatId = update.message_reaction.chat.id;
-    const reactionMessageId = update.message_reaction.message_id;
-    if (reactionUserId) {
-      const reactionEmojis = (update.message_reaction.new_reaction || [])
-        .map((item) => item.emoji)
-        .filter((emoji): emoji is string => Boolean(emoji));
-      const reactions = reactionEmojis.join(' ');
-      if (reactions) {
-        await addToHistory(reactionUserId, {
-          role: 'user',
-          content: `[Реакция пользователя: ${reactions}]`,
-          timestamp: Date.now(),
-        });
-
-        const reactionSignal = classifyReactionSignal(reactionEmojis);
-        await saveMessageSignal(
-          reactionUserId,
-          reactionChatId,
-          reactionMessageId,
-          'reaction',
-          reactionSignal,
-          {
-            oldReaction: update.message_reaction.old_reaction || [],
-            newReaction: update.message_reaction.new_reaction || [],
-          }
-        );
+  const updateId = Number.isFinite(update.update_id) ? Number(update.update_id) : null;
+  const updateScope = update.message?.chat.id
+    ? {
+        userId: update.message?.from.id ?? update.callback_query?.from.id ?? update.message_reaction?.user?.id ?? 0,
+        chatId: update.message.chat.id,
+        type: 'message',
       }
+    : update.callback_query?.message?.chat.id
+      ? {
+          userId: update.callback_query.from.id,
+          chatId: update.callback_query.message.chat.id,
+          type: 'callback_query',
+        }
+      : update.message_reaction?.chat.id
+        ? {
+            userId: update.message_reaction.user?.id || 0,
+            chatId: update.message_reaction.chat.id,
+            type: 'message_reaction',
+          }
+        : null;
+
+  if (updateId !== null && updateScope && Number.isFinite(updateScope.userId) && updateScope.userId > 0) {
+    try {
+      const accepted = await markUpdateProcessed(updateId, updateScope.userId, updateScope.chatId, updateScope.type);
+      if (!accepted) {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+    } catch (error) {
+      if (NODE_ENV === 'production') {
+        return res.status(503).json({ ok: false, error: 'dedupe_unavailable' });
+      }
+      console.error('Failed to apply update dedupe:', sanitizeForLog(String(error)));
+    }
+  }
+
+  if (update.message_reaction) {
+    try {
+      const reactionUserId = update.message_reaction.user?.id;
+      const reactionChatId = update.message_reaction.chat.id;
+      const reactionMessageId = update.message_reaction.message_id;
+      if (reactionUserId && isAllowedUser(reactionUserId)) {
+        const reactionEmojis = (update.message_reaction.new_reaction || [])
+          .map((item) => item.emoji)
+          .filter((emoji): emoji is string => Boolean(emoji));
+        const reactions = reactionEmojis.join(' ');
+        if (reactions) {
+          await addToHistory(reactionUserId, {
+            role: 'user',
+            content: `[Реакция пользователя: ${reactions}]`,
+            timestamp: Date.now(),
+          });
+
+          const reactionSignal = classifyReactionSignal(reactionEmojis);
+          await persistSignalSafely(
+            reactionUserId,
+            reactionChatId,
+            reactionMessageId,
+            'reaction',
+            reactionSignal,
+            {
+              oldReaction: update.message_reaction.old_reaction || [],
+              newReaction: update.message_reaction.new_reaction || [],
+            }
+          );
+        }
+      }
+    } catch (error) {
+      if (isDuplicateUpdateError(error)) {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+      console.error('Reaction update handling failed:', sanitizeForLog(String(error)));
     }
     return res.status(200).json({ ok: true });
   }
@@ -168,30 +376,47 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
     const messageId = cb.message?.message_id;
     const cbUserId = cb.from.id;
 
-    if (cb.data === 'clear_confirm' && chatId && messageId) {
-      await clearHistory(cbUserId);
-      await clearChatSummaries(cbUserId);
-      await clearInboundEvents(cbUserId);
-      await clearProactiveJobs(cbUserId);
-      await editMessage(chatId, messageId, '🗑️ История очищена!');
-      await answerCallback(cb.id, 'Готово!');
-    } else if (cb.data === 'clear_cancel' && chatId && messageId) {
-      await editMessage(chatId, messageId, '❌ Очистка отменена.');
-      await answerCallback(cb.id);
-    } else if (cb.data?.startsWith('tts:') && chatId) {
-      await answerCallback(cb.id, '🔊 Генерирую аудио...');
-      const history = await getHistory(cbUserId);
-      const lastModelMessage = [...history].reverse().find((m) => m.role === 'model');
-      if (lastModelMessage) {
-        const audioBuffer = await textToSpeech(lastModelMessage.content);
-        if (audioBuffer) {
-          await sendVoice(chatId, audioBuffer);
-        } else {
-          await sendTelegram(chatId, '❌ Не удалось сгенерировать аудио. Попробуй позже.');
-        }
+    try {
+      if (!isAllowedUser(cbUserId)) {
+        await answerCallback(cb.id, 'Доступ запрещён');
+        return res.status(200).json({ ok: true });
       }
-    } else {
-      await answerCallback(cb.id);
+
+      if (cb.data === 'clear_confirm' && chatId && messageId) {
+        await clearHistory(cbUserId);
+        await clearChatSummaries(cbUserId);
+        await clearInboundEvents(cbUserId);
+        await clearProactiveJobs(cbUserId);
+        await editMessage(chatId, messageId, '🗑️ История очищена!');
+        await answerCallback(cb.id, 'Готово!');
+      } else if (cb.data === 'clear_cancel' && chatId && messageId) {
+        await editMessage(chatId, messageId, '❌ Очистка отменена.');
+        await answerCallback(cb.id);
+      } else if (cb.data?.startsWith('tts:') && chatId) {
+        await answerCallback(cb.id, '🔊 Генерирую аудио...');
+        const history = await getHistory(cbUserId);
+        const lastModelMessage = [...history].reverse().find((m) => m.role === 'model');
+        if (lastModelMessage) {
+          const audioBuffer = await textToSpeech(lastModelMessage.content);
+          if (audioBuffer) {
+            await sendVoice(chatId, audioBuffer);
+          } else {
+            await sendTelegram(chatId, '❌ Не удалось сгенерировать аудио. Попробуй позже.');
+          }
+        }
+      } else {
+        await answerCallback(cb.id);
+      }
+    } catch (error) {
+      if (isDuplicateUpdateError(error)) {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+      console.error('Callback handling failed:', sanitizeForLog(String(error)));
+      try {
+        await answerCallback(cb.id, 'Ошибка обработки');
+      } catch {
+        // noop
+      }
     }
     return res.status(200).json({ ok: true });
   }
@@ -210,18 +435,52 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
   const hasVideoNote = !!message.video_note;
   const hasDocument = !!message.document;
   const hasSticker = !!message.sticker;
+  const hasAnimation = !!message.animation;
 
-  if (ADMIN_USER_ID !== null && userId !== ADMIN_USER_ID) {
+  if (!isAllowedUser(userId)) {
     await sendTelegram(chatId, 'Извини, этот бот приватный.');
     return res.status(200).json({ ok: true });
   }
 
-  if (!text && !hasPhoto && !hasVoice && !hasAudio && !hasVideo && !hasVideoNote && !hasDocument && !hasSticker) {
+  if (hasSticker && message.sticker) {
+    try {
+      const stickerSignal = classifyStickerSignal(message.sticker.emoji, message.sticker.set_name);
+      await persistSignalSafely(userId, chatId, message.message_id, 'sticker', stickerSignal, {
+        emoji: message.sticker.emoji,
+        setName: message.sticker.set_name,
+        fileId: message.sticker.file_id,
+      });
+    } catch (error) {
+      if (isDuplicateUpdateError(error)) {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+      console.warn('Failed to persist sticker signal:', sanitizeForLog(String(error)));
+    }
+  }
+
+  if (hasAnimation && message.animation) {
+    try {
+      const gifSignal = classifyGifSignal(message.animation.file_name, message.animation.mime_type);
+      await persistSignalSafely(userId, chatId, message.message_id, 'gif', gifSignal, {
+        fileId: message.animation.file_id,
+        fileName: message.animation.file_name,
+        mimeType: message.animation.mime_type,
+      });
+    } catch (error) {
+      if (isDuplicateUpdateError(error)) {
+        return res.status(200).json({ ok: true, duplicate: true });
+      }
+      console.warn('Failed to persist gif signal:', sanitizeForLog(String(error)));
+    }
+  }
+
+  if (!text && !hasPhoto && !hasVoice && !hasAudio && !hasVideo && !hasVideoNote && !hasDocument && !hasSticker && !hasAnimation) {
     return res.status(200).json({ ok: true });
   }
 
   let typingInterval: NodeJS.Timeout | null = null;
   let pendingBatchIds: number[] = [];
+  let batchFinalized = false;
 
   try {
     if (text === '🔍 Поиск') {
@@ -502,7 +761,11 @@ ${progressBar} ${contextStats.percent}%
         await sendTelegram(chatId, '❌ Использование: <code>/pin 123</code>', undefined, true);
         return res.status(200).json({ ok: true });
       }
-      await setMemoryPinned(memoryItemId, true);
+      const updated = await setMemoryPinned(userId, memoryItemId, true);
+      if (!updated) {
+        await sendTelegram(chatId, '❌ Не удалось закрепить память: элемент не найден или недоступен.', undefined, true);
+        return res.status(200).json({ ok: true });
+      }
       await sendTelegram(chatId, `📌 Память #${memoryItemId} закреплена.`, undefined, true);
       return res.status(200).json({ ok: true });
     }
@@ -514,7 +777,11 @@ ${progressBar} ${contextStats.percent}%
         await sendTelegram(chatId, '❌ Использование: <code>/unpin 123</code>', undefined, true);
         return res.status(200).json({ ok: true });
       }
-      await setMemoryPinned(memoryItemId, false);
+      const updated = await setMemoryPinned(userId, memoryItemId, false);
+      if (!updated) {
+        await sendTelegram(chatId, '❌ Не удалось открепить память: элемент не найден или недоступен.', undefined, true);
+        return res.status(200).json({ ok: true });
+      }
       await sendTelegram(chatId, `📍 Память #${memoryItemId} откреплена.`, undefined, true);
       return res.status(200).json({ ok: true });
     }
@@ -595,30 +862,28 @@ ${progressBar} ${contextStats.percent}%
         const docData = await downloadFile(doc.file_id, doc.mime_type);
         try {
           const content = Buffer.from(docData.data, 'base64').toString('utf-8');
-          const memoryData = JSON.parse(content);
-          if (memoryData.history) {
+          const memoryData = parseImportPayload(content);
+
+          const historyForImport = memoryData.history.slice(-MAX_HISTORY_MESSAGES);
+          if (historyForImport.length > 0) {
+            await replaceHistorySafely(userId, historyForImport);
+          } else {
             await clearHistory(userId);
-            for (const msg of memoryData.history.slice(-MAX_HISTORY_MESSAGES)) {
-              await addToHistory(userId, msg);
-            }
           }
           if (memoryData.insights) {
             await saveUserSettings(userId, memoryData.insights);
           }
-          if (memoryData.memory) {
-            await clearLongTermMemory(userId);
-            for (const fact of memoryData.memory.facts) await addMemoryItem(userId, 'fact', fact);
-            for (const pref of memoryData.memory.preferences) await addMemoryItem(userId, 'preference', pref);
-            for (const goal of memoryData.memory.goals) await addMemoryItem(userId, 'goal', goal);
+          if (memoryData.memory.facts.length > 0 || memoryData.memory.preferences.length > 0 || memoryData.memory.goals.length > 0) {
+            await replaceLongTermMemorySafely(userId, memoryData.memory);
           }
           await sendTelegram(
             chatId,
-            `✅ Память импортирована!\n• Сообщений: ${memoryData.history?.length || 0}\n• Контекст: ${memoryData.insights?.length || 0} символов\n• Факты: ${memoryData.memory?.facts?.length || 0}`,
+            `✅ Память импортирована!\n• Сообщений: ${historyForImport.length}\n• Контекст: ${memoryData.insights.length} символов\n• Факты: ${memoryData.memory.facts.length}`,
             undefined,
             true
           );
           return res.status(200).json({ ok: true });
-        } catch (e) {
+        } catch {
           await sendTelegram(chatId, '❌ Ошибка при импорте. Проверь формат файла.', undefined, true);
           return res.status(200).json({ ok: true });
         }
@@ -631,13 +896,13 @@ ${progressBar} ${contextStats.percent}%
     }
 
     await new Promise((resolve) => setTimeout(resolve, BATCHING.debounceMs));
-    if (await shouldWaitForBatch(userId, chatId, enqueued.eventTs)) {
+    if (await shouldWaitForBatch(userId, chatId, enqueued.eventId)) {
       return res.status(200).json({ ok: true });
     }
 
     typingInterval = startTypingLoop(chatId);
 
-    const batch = await buildInboundBatch(userId, chatId, enqueued.eventTs, BATCHING.pendingLimit);
+    const batch = await buildInboundBatch(userId, chatId, enqueued.eventId, BATCHING.pendingLimit);
     pendingBatchIds = batch.eventIds;
     if (batch.eventIds.length === 0) {
       if (typingInterval) clearInterval(typingInterval);
@@ -651,28 +916,19 @@ ${progressBar} ${contextStats.percent}%
       .map((part) => part.text as string)
       .slice(0, 5);
 
-    for (const signalText of signalCandidates) {
-      await ingestMemoryFromText(userId, 'signal', signalText, {
-        importance: 0.55,
-        confidence: 0.6,
-        sourceMessageId: batch.replyToMessageId,
-        chunkMeta: { source: 'inbound-batch-signal' },
-      });
-    }
-
     const retrievalStart = Date.now();
     const memoryContext =
       MEMORY_RETRIEVAL_MODE === 'supabase'
         ? await buildSupabaseMemoryContext(userId, batchHistoryText)
         : await buildMemoryRagContext(userId, batchHistoryText);
     const retrievalLatency = Date.now() - retrievalStart;
-    await saveMetric(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
+    await saveMetricSafe(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
       mode: MEMORY_RETRIEVAL_MODE,
       hasContext: Boolean(memoryContext),
     });
 
     if (memoryContext) {
-      await saveMetric(userId, 'memory_retrieval_hit', 1, {
+      await saveMetricSafe(userId, 'memory_retrieval_hit', 1, {
         mode: MEMORY_RETRIEVAL_MODE,
       });
     }
@@ -680,12 +936,6 @@ ${progressBar} ${contextStats.percent}%
     const partsForModel = memoryContext
       ? [...batch.parts, { text: `[Релевантная память:${MEMORY_RETRIEVAL_MODE}]\n${memoryContext}` }]
       : batch.parts;
-
-    await addToHistory(userId, {
-      role: 'user',
-      content: batchHistoryText,
-      timestamp: Date.now(),
-    });
 
     const systemPrompt = await buildSystemPrompt(userId);
     const contextBundle = await buildContextMessages(
@@ -700,7 +950,7 @@ ${progressBar} ${contextStats.percent}%
       forceSearch,
     });
     const modelLatency = Date.now() - modelStart;
-    await saveMetric(userId, 'model_latency_ms', modelLatency, {
+    await saveMetricSafe(userId, 'model_latency_ms', modelLatency, {
       model: GEMINI_MODEL,
       mode: MEMORY_RETRIEVAL_MODE,
     });
@@ -735,6 +985,25 @@ ${progressBar} ${contextStats.percent}%
     if (result.sources && result.sources.length > 0) {
       await saveLastSources(userId, result.sources);
     }
+
+    await finalizeInboundBatch(batch.eventIds);
+    batchFinalized = true;
+    pendingBatchIds = [];
+
+    for (const signalText of signalCandidates) {
+      await ingestMemoryFromText(userId, 'signal', signalText, {
+        importance: 0.55,
+        confidence: 0.6,
+        sourceMessageId: batch.replyToMessageId,
+        chunkMeta: { source: 'inbound-batch-signal' },
+      });
+    }
+
+    await addToHistory(userId, {
+      role: 'user',
+      content: batchHistoryText,
+      timestamp: Date.now(),
+    });
 
     await addToHistory(userId, { role: 'model', content: cleanText, timestamp: Date.now() });
 
@@ -795,7 +1064,7 @@ ${progressBar} ${contextStats.percent}%
             reason: 'heuristic_policy_mode',
           };
 
-    await saveMetric(userId, 'signal_policy_decision', outboundSignal.confidence, {
+    await saveMetricSafe(userId, 'signal_policy_decision', outboundSignal.confidence, {
       mode: OUTBOUND_SIGNAL_POLICY_MODE,
       kind: outboundSignal.kind,
       intent: outboundSignal.intent,
@@ -816,16 +1085,16 @@ ${progressBar} ${contextStats.percent}%
       }
     }
 
-    await finalizeInboundBatch(batch.eventIds);
-    pendingBatchIds = [];
-
   } catch (error) {
     if (typingInterval) clearInterval(typingInterval);
-    if (pendingBatchIds.length > 0) {
+    if (pendingBatchIds.length > 0 && !batchFinalized) {
       console.error('Inbound batch failed, kept pending for retry:', pendingBatchIds.join(','));
     }
-    console.error('Error:', error);
-    await sendTelegram(chatId, formatError(error), undefined, true);
+    if (isDuplicateUpdateError(error)) {
+      return res.status(200).json({ ok: true, duplicate: true });
+    }
+    console.error('Webhook processing error:', sanitizeForLog(String(error)));
+    await notifyErrorSafely(chatId, error);
   }
 
   return res.status(200).json({ ok: true });

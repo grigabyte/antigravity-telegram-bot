@@ -16,6 +16,65 @@ import { parseTextDocument } from '../parsers/documents.js';
 import { extractUrls, fetchUrlContent } from '../parsers/urls.js';
 import { classifyGifSignalAdvanced, classifyStickerSignalAdvanced } from '../semantics/signal-classifier.js';
 
+function buildSignalFallback(): InboundEventPayload['signal'] {
+  return {
+    kind: 'none',
+    emotion: 'unknown',
+    intent: 'unknown',
+    confidence: 0,
+  };
+}
+
+async function classifyInboundSignal(update: TelegramUpdate): Promise<InboundEventPayload['signal']> {
+  const message = update.message;
+  if (!message) return buildSignalFallback();
+
+  if (message.sticker) {
+    return classifyStickerSignalAdvanced({
+      emoji: message.sticker.emoji,
+      setName: message.sticker.set_name,
+      fileId: message.sticker.file_id,
+    });
+  }
+
+  if (message.animation) {
+    return classifyGifSignalAdvanced({
+      fileId: message.animation.file_id,
+      fileName: message.animation.file_name,
+      mimeType: message.animation.mime_type,
+    });
+  }
+
+  return buildSignalFallback();
+}
+
+async function enqueueInboundMessageInternal(
+  update: TelegramUpdate,
+  textValue: string
+): Promise<{ eventTs: number; eventId: number } | null> {
+  const message = update.message;
+  if (!message) return null;
+
+  const payload: InboundEventPayload = {
+    messageId: message.message_id,
+    date: message.date,
+    text: textValue,
+    mediaGroupId: message.media_group_id,
+    attachments: extractAttachments(update),
+    sticker: message.sticker
+      ? {
+          fileId: message.sticker.file_id,
+          emoji: message.sticker.emoji,
+          setName: message.sticker.set_name,
+        }
+      : undefined,
+    signal: await classifyInboundSignal(update),
+  };
+
+  const appended = await appendInboundEvent(message.from.id, message.chat.id, Date.now(), payload);
+  return { eventTs: appended.eventTs, eventId: appended.id };
+}
+
 function extractAttachments(update: TelegramUpdate): InboundAttachment[] {
   const message = update.message;
   if (!message) return [];
@@ -58,110 +117,22 @@ function extractAttachments(update: TelegramUpdate): InboundAttachment[] {
   return attachments;
 }
 
-export async function enqueueInboundMessage(update: TelegramUpdate): Promise<{ eventTs: number } | null> {
-  const message = update.message;
-  if (!message) return null;
-
-  const signal = message.sticker
-    ? await classifyStickerSignalAdvanced({
-        emoji: message.sticker.emoji,
-        setName: message.sticker.set_name,
-        fileId: message.sticker.file_id,
-      })
-    : message.animation
-      ? await classifyGifSignalAdvanced({
-          fileId: message.animation.file_id,
-          fileName: message.animation.file_name,
-          mimeType: message.animation.mime_type,
-        })
-      : {
-          kind: 'none' as const,
-          emotion: 'unknown' as const,
-          intent: 'unknown' as const,
-          confidence: 0,
-        };
-
-  const payload: InboundEventPayload = {
-    messageId: message.message_id,
-    date: message.date,
-    text: message.text || message.caption || '',
-    mediaGroupId: message.media_group_id,
-    attachments: extractAttachments(update),
-    sticker: message.sticker
-      ? {
-          fileId: message.sticker.file_id,
-          emoji: message.sticker.emoji,
-          setName: message.sticker.set_name,
-        }
-      : undefined,
-    signal,
-  };
-
-  const appended = await appendInboundEvent(
-    message.from.id,
-    message.chat.id,
-    Date.now(),
-    payload
-  );
-
-  return { eventTs: appended.eventTs };
-}
-
 export async function enqueueInboundMessageWithText(
   update: TelegramUpdate,
   textOverride: string
-): Promise<{ eventTs: number } | null> {
-  const message = update.message;
-  if (!message) return null;
-
-  const signal = message.sticker
-    ? await classifyStickerSignalAdvanced({
-        emoji: message.sticker.emoji,
-        setName: message.sticker.set_name,
-        fileId: message.sticker.file_id,
-      })
-    : message.animation
-      ? await classifyGifSignalAdvanced({
-          fileId: message.animation.file_id,
-          fileName: message.animation.file_name,
-          mimeType: message.animation.mime_type,
-        })
-      : {
-          kind: 'none' as const,
-          emotion: 'unknown' as const,
-          intent: 'unknown' as const,
-          confidence: 0,
-        };
-
-  const payload: InboundEventPayload = {
-    messageId: message.message_id,
-    date: message.date,
-    text: textOverride,
-    mediaGroupId: message.media_group_id,
-    attachments: extractAttachments(update),
-    sticker: message.sticker
-      ? {
-          fileId: message.sticker.file_id,
-          emoji: message.sticker.emoji,
-          setName: message.sticker.set_name,
-        }
-      : undefined,
-    signal,
-  };
-
-  const appended = await appendInboundEvent(message.from.id, message.chat.id, Date.now(), payload);
-  return { eventTs: appended.eventTs };
+): Promise<{ eventTs: number; eventId: number } | null> {
+  return enqueueInboundMessageInternal(update, textOverride);
 }
 
 export async function shouldWaitForBatch(
   userId: number,
   chatId: number,
-  currentEventTs: number
+  currentEventId: number
 ): Promise<boolean> {
   const latest = await getLatestPendingInboundEvent(userId, chatId);
   if (!latest) return false;
 
-  return latest.eventTs > currentEventTs;
+  return latest.id > currentEventId;
 }
 
 function normalizeStickerText(event: InboundEventRecord): string | null {
@@ -325,7 +296,7 @@ function mergeMediaGroups(events: InboundEventRecord[]): InboundEventRecord[] {
 export async function buildInboundBatch(
   userId: number,
   chatId: number,
-  eventTs: number,
+  eventId: number,
   limit: number = 50
 ): Promise<{
   parts: Part[];
@@ -333,7 +304,7 @@ export async function buildInboundBatch(
   replyToMessageId?: number;
   eventIds: number[];
 }> {
-  const events = await getPendingInboundEvents(userId, chatId, eventTs, limit);
+  const events = await getPendingInboundEvents(userId, chatId, eventId, limit);
   const mergedEvents = mergeMediaGroups(events);
 
   const parts: Part[] = [];
