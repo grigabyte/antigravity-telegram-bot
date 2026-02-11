@@ -14,7 +14,7 @@
 
 ### AI & Context
 - **Gemini 3 Pro** — Google's most capable model via Antigravity OAuth
-- **1M+ token context** — remembers entire conversation history
+- **1M+ token context** — использует summary + последние 500 сообщений
 - **Smart compression** — automatically summarizes old messages at 800K tokens
 - **Long-term memory** — extracts and stores facts, preferences, goals
 - **Google Search** — real-time web search integration
@@ -53,6 +53,13 @@
 | `/goal <text>` | Add goal |
 | `/clearmemory` | Clear long-term memory |
 | `/voice <text>` | Get voice response (TTS) |
+| `/remind <text>` | Set proactive reminder for tomorrow |
+| `/tz <IANA zone>` | Set user timezone (e.g. Europe/Moscow) |
+| `/quiet <HH-HH>` | Set quiet hours window (e.g. 23-09) |
+| `/time` | Show current bot time context |
+| `/pin <id>` | Pin a memory item (v2 memory) |
+| `/unpin <id>` | Unpin a memory item |
+| `/memorysearch <query>` | Debug semantic memory retrieval |
 
 ---
 
@@ -167,6 +174,50 @@ CREATE INDEX idx_chat_summaries_user_id ON chat_summaries(user_id);
    - **Project URL** (looks like `https://abcdefg.supabase.co`)
    - **service_role key** (secret key, starts with `eyJ...`)
 
+7. (Recommended) Run additional SQL for batching + proactive features:
+
+```sql
+-- contents of scripts/setup-batching-and-proactive.sql
+CREATE TABLE IF NOT EXISTS inbound_events (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  event_ts BIGINT NOT NULL,
+  payload JSONB NOT NULL,
+  processed BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_events_pending
+  ON inbound_events(user_id, chat_id, processed, event_ts);
+
+CREATE TABLE IF NOT EXISTS proactive_jobs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  job_type TEXT NOT NULL,
+  due_at BIGINT NOT NULL,
+  payload JSONB NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'cancelled')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  sent_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_proactive_jobs_due
+  ON proactive_jobs(status, due_at);
+```
+
+8. (Advanced, recommended for semantic signals + dynamic reactions/stickers/GIF + RAG):
+
+```sql
+-- run scripts/setup-advanced-memory-and-signals.sql
+-- includes:
+-- - message_signals
+-- - reaction/sticker/gif catalogs + events
+-- - memory_items_v2 + memory_chunks
+-- - pgvector extension and match_memory_chunks RPC
+```
+
 ---
 
 ### Step 4: Get Antigravity OAuth Credentials
@@ -263,6 +314,12 @@ Tell Telegram where to send messages:
 curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://<YOUR_VERCEL_URL>/api/webhook"
 ```
 
+Better: use the helper script (includes callback queries + reactions in `allowed_updates`):
+
+```bash
+VERCEL_URL=your-app.vercel.app TELEGRAM_BOT_TOKEN=your-token npm run set-webhook
+```
+
 Replace:
 - `<YOUR_BOT_TOKEN>` with your Telegram bot token
 - `<YOUR_VERCEL_URL>` with your Vercel deployment URL
@@ -311,6 +368,25 @@ Expected response:
 | `ANTIGRAVITY_PROJECT_ID` | Yes | Antigravity Project ID |
 | `ELEVENLABS_API_KEY` | No | ElevenLabs API key for TTS |
 | `ELEVENLABS_VOICE_ID` | No | Voice ID (default: Chris) |
+| `OPENROUTER_API_KEY` | No* | Required for real embeddings in RAG memory |
+| `OPENROUTER_EMBEDDING_MODEL_PRIMARY` | No | Primary embeddings model (default: qwen/qwen3-embedding-8b) |
+| `OPENROUTER_EMBEDDING_MODEL_FALLBACK` | No | Fallback embeddings model (default: openai/text-embedding-3-small) |
+| `OPENROUTER_EMBEDDING_DIM` | No | Target vector size for DB (default: 1024) |
+| `MEMORY_RETRIEVAL_MODE` | No | `rag` or `supabase` (default: `rag`) |
+| `OUTBOUND_SIGNAL_POLICY_MODE` | No | `llm` or `heuristic` (default: `llm`) |
+| `SIGNAL_CLASSIFIER_MODE` | No | `hybrid` or `metadata` (default: `hybrid`) |
+| `TELEGRAM_REACTION_MIN_INTERVAL_MS` | No | Global min interval for reactions (default: 30000) |
+| `TELEGRAM_STICKER_MIN_INTERVAL_MS` | No | Global min interval for stickers (default: 180000) |
+| `TELEGRAM_GIF_MIN_INTERVAL_MS` | No | Global min interval for GIFs (default: 180000) |
+| `TELEGRAM_STICKER_CELEBRATE` | No | Sticker file_id for celebratory replies |
+| `TELEGRAM_STICKER_SUPPORT` | No | Sticker file_id for supportive replies |
+
+### Memory modes
+
+- `MEMORY_RETRIEVAL_MODE=rag`: vector retrieval via `memory_chunks` + embeddings (OpenRouter if configured).
+- `MEMORY_RETRIEVAL_MODE=supabase`: lexical retrieval from Supabase history/signals (no embeddings API cost).
+
+Both modes are compatible with the same data model. You can switch between them without destructive migration.
 
 ---
 
@@ -319,10 +395,54 @@ Expected response:
 ```
 antigravity-telegram-bot/
 ├── api/
-│   └── webhook.ts           # All bot logic (~1600 lines)
+│   └── webhook.ts           # Vercel entrypoint (delegates to src/)
+│   └── proactive.ts         # Cron endpoint for proactive jobs
+├── src/
+│   ├── ai/
+│   │   └── gemini.ts         # OAuth + Gemini calls
+│   ├── db/
+│   │   └── supabase.ts       # Supabase REST operations
+│   ├── handlers/
+│   │   └── webhook.ts        # Main update handler
+│   ├── memory/
+│   │   ├── chunker.ts        # Text chunking for vector memory
+│   │   ├── compression.ts    # Context compression
+│   │   ├── context.ts        # System prompt + stats helpers
+│   │   ├── embeddings.ts     # Embedding provider helpers
+│   │   ├── rag-memory.ts     # RAG ingestion + retrieval context builder
+│   │   └── retrieval.ts      # Hybrid memory retrieval helpers
+│   ├── proactive/
+│   │   └── scheduler.ts      # Proactive jobs scheduling + runner
+│   ├── decision/
+│   │   └── catalog-policy.ts # Catalog-based reaction/sticker/GIF decisions
+│   ├── network/
+│   │   └── fetch.ts          # fetchWithTimeout helper
+│   ├── parsers/
+│   │   ├── documents.ts      # TXT/MD/DOCX parsing
+│   │   └── urls.ts           # URL + YouTube parsing
+│   ├── semantics/
+│   │   └── signal-classifier.ts  # Sticker/GIF/reaction semantic classification
+│   ├── security/
+│   │   └── url-guard.ts      # SSRF protection
+│   ├── telegram/
+│   │   ├── client.ts         # Telegram API client
+│   │   ├── files.ts          # File download helpers
+│   │   ├── formatting.ts     # HTML formatting
+│   │   ├── inbound-events.ts # Batching for chaotic multi-message chats
+│   │   ├── keyboards.ts      # Reply/inline keyboards
+│   │   ├── reactions.ts      # Message reactions support
+│   │   └── stickers.ts       # Optional sticker replies
+│   ├── utils/
+│   │   └── text.ts           # text helpers
+│   ├── time/
+│   │   └── clock.ts          # Timezone + quiet-hours logic
+│   ├── config.ts             # Environment + constants
+│   └── types.ts              # Shared types
 ├── scripts/
 │   ├── set-webhook.js       # Telegram webhook setup
 │   ├── setup-supabase.sql   # Database schema
+│   ├── setup-batching-and-proactive.sql  # Extra schema (inbound_events + proactive_jobs)
+│   ├── setup-advanced-memory-and-signals.sql # Signal catalogs + pgvector memory schema
 │   └── import-ai-studio.ts  # Import history from AI Studio
 ├── .env.example             # Environment template
 ├── vercel.json              # Vercel config (300s timeout)
@@ -369,6 +489,30 @@ The script extracts actual model responses (skips thinking blocks) and imports t
 2. Access token is used to call Gemini 3 Pro API
 3. Tokens refresh automatically when expired
 
+### Context Assembly
+
+Each Gemini request is built from:
+1. **All summaries** in `chat_summaries` (compressed history)
+2. **Last 500 messages** from `chat_history`
+3. The **current user message** (with media parts if any)
+
+This keeps context bounded while preserving long-term memory.
+
+```text
+┌───────────────┐
+│ chat_summaries│
+└──────┬────────┘
+       │ (all summaries)
+┌──────▼────────┐     ┌─────────────────────┐
+│ recent 500    │     │ current user input  │
+│ chat_history  │     │ (text/media parts)  │
+└──────┬────────┘     └──────────┬──────────┘
+       │                         │
+       └──────────┬──────────────┘
+                  ▼
+           Gemini request
+```
+
 ### Context Compression
 
 When conversation exceeds 800K tokens:
@@ -395,6 +539,7 @@ Bot automatically extracts user information:
 | `MAX_CONTEXT_TOKENS` | 900,000 | Maximum context window |
 | `COMPRESS_THRESHOLD` | 800,000 | When to start compression |
 | `MAX_HISTORY_MESSAGES` | 10,000 | Max stored messages |
+| `MAX_CONTEXT_MESSAGES` | 500 | Messages included in model context |
 | `maxOutputTokens` | 65,536 | Max response length |
 
 ### Voice Settings (ElevenLabs)
@@ -473,5 +618,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Supabase](https://supabase.com) — PostgreSQL database
 - [ElevenLabs](https://elevenlabs.io) — Text-to-speech
 - [Telegram Bot API](https://core.telegram.org/bots/api) — Messaging platform
-
-

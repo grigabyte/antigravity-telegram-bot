@@ -27,7 +27,13 @@ async function setWebhook() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       url: webhookUrl,
-      allowed_updates: ['message'],
+      allowed_updates: [
+        'message',
+        'edited_message',
+        'callback_query',
+        'message_reaction',
+        'message_reaction_count',
+      ],
     }),
   });
 

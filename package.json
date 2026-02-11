@@ -6,13 +6,7 @@
   "scripts": {
     "dev": "vercel dev",
     "deploy": "vercel --prod",
-    "set-webhook": "node scripts/set-webhook.js",
-    "summarize": "node scripts/summarize-chat.js"
-  },
-  "dependencies": {
-    "@upstash/redis": "^1.34.3",
-    "googleapis": "^144.0.0",
-    "msedge-tts": "^2.0.4"
+    "set-webhook": "node scripts/set-webhook.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

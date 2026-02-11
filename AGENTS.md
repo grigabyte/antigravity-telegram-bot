@@ -179,7 +179,7 @@ Then test in Telegram by sending `/start` to the bot.
 
 | Property | Value |
 |----------|-------|
-| Main file | `api/webhook.ts` (~1600 lines) |
+| Main file | `api/webhook.ts` (entrypoint) + `src/handlers/webhook.ts` (logic) |
 | Runtime | Vercel Serverless (Fluid Compute) |
 | Timeout | 300 seconds |
 | Language | TypeScript |
@@ -192,7 +192,33 @@ Then test in Telegram by sending `/start` to the bot.
 ```
 antigravity-telegram-bot/
 ├── api/
-│   └── webhook.ts           # ALL bot logic (single-file architecture)
+│   └── webhook.ts           # Vercel entrypoint (delegates to src/)
+├── src/
+│   ├── ai/
+│   │   └── gemini.ts         # OAuth + Gemini calls
+│   ├── db/
+│   │   └── supabase.ts       # Supabase REST operations
+│   ├── handlers/
+│   │   └── webhook.ts        # Main update handler
+│   ├── memory/
+│   │   ├── compression.ts    # Context compression
+│   │   └── context.ts        # System prompt + stats helpers
+│   ├── network/
+│   │   └── fetch.ts          # fetchWithTimeout helper
+│   ├── parsers/
+│   │   ├── documents.ts      # TXT/MD/DOCX parsing
+│   │   └── urls.ts           # URL + YouTube parsing
+│   ├── security/
+│   │   └── url-guard.ts      # SSRF protection
+│   ├── telegram/
+│   │   ├── client.ts         # Telegram API client
+│   │   ├── files.ts          # File download helpers
+│   │   ├── formatting.ts     # HTML formatting
+│   │   └── keyboards.ts      # Reply/inline keyboards
+│   ├── utils/
+│   │   └── text.ts           # text helpers
+│   ├── config.ts             # Environment + constants
+│   └── types.ts              # Shared types
 ├── scripts/
 │   ├── set-webhook.js       # Telegram webhook configuration
 │   ├── setup-supabase.sql   # Database schema
@@ -224,25 +250,22 @@ antigravity-telegram-bot/
 
 ## Code Architecture
 
-The bot uses a **single-file architecture** for simplicity. All logic is in `api/webhook.ts`.
+The bot uses a **modular architecture**. Entry is in `api/webhook.ts`, logic in `src/`.
 
-### Code Sections (with line numbers)
+### Code Sections (by module)
 
 ```
-Line 1-50:      CONFIG (environment variables, API endpoints, constants)
-Line 54-115:    TYPES (TypeScript interfaces)
-Line 116-148:   ERROR MESSAGES (user-friendly error handling)
-Line 150-275:   SUPABASE (database operations)
-Line 277-296:   OAUTH (Google token refresh via Antigravity)
-Line 298-395:   URL & YOUTUBE PARSING
-Line 397-433:   TEXT DOCUMENT PARSING
-Line 435-544:   GEMINI 3 PRO (API calls with retry logic)
-Line 546-591:   MEMORY HELPERS (export/import)
-Line 593-803:   SMART CONTEXT COMPRESSION
-Line 805-881:   SYSTEM PROMPT BUILDER
-Line 883-1070:  TELEGRAM HELPERS (sendMessage, sendVoice, etc.)
-Line 1072-1114: FILE DOWNLOAD
-Line 1116-1622: MAIN HANDLER (command routing, message processing)
+src/config.ts              CONFIG (environment variables, API endpoints, constants)
+src/types.ts               TYPES (TypeScript interfaces)
+src/db/supabase.ts         SUPABASE (database operations)
+src/ai/gemini.ts           OAUTH + GEMINI 3 PRO (API calls with retry logic)
+src/parsers/urls.ts        URL & YOUTUBE PARSING
+src/parsers/documents.ts   TEXT DOCUMENT PARSING
+src/memory/context.ts      SYSTEM PROMPT BUILDER
+src/memory/compression.ts  SMART CONTEXT COMPRESSION
+src/telegram/*             TELEGRAM HELPERS (sendMessage, sendVoice, etc.)
+src/handlers/webhook.ts    MAIN HANDLER (command routing, message processing)
+api/webhook.ts             Vercel entrypoint
 ```
 
 ### Key Constants
@@ -321,26 +344,31 @@ const ELEVENLABS_VOICE_ID = 'iP95p4xoKVk53GoZ742B'; // Chris voice
 
 ## Bot Commands
 
-| Command | Description | Handler Line |
-|---------|-------------|--------------|
-| `/start` | Show help | ~1214 |
-| `/stats` | Usage statistics | ~1231 |
-| `/memory` | View long-term memory | ~1265 |
-| `/sources` | Last search sources | ~1362 |
-| `/search <query>` | Force web search | ~1388 |
-| `/export` | Export all data as JSON | ~1331 |
-| `/import` | Import from file | ~1339 |
-| `/insights <text>` | Set user context | ~1344 |
-| `/clear` | Clear history (with confirmation) | ~1321 |
-| `/fact <text>` | Add fact to memory | ~1297 |
-| `/pref <text>` | Add preference | ~1303 |
-| `/goal <text>` | Add goal | ~1309 |
-| `/clearmemory` | Clear long-term memory | ~1315 |
-| `/voice <text>` | Get voice reply | ~1376 |
+| Command | Description | Handler Module |
+|---------|-------------|----------------|
+| `/start` | Show help | `src/handlers/webhook.ts` |
+| `/stats` | Usage statistics | `src/handlers/webhook.ts` |
+| `/memory` | View long-term memory | `src/handlers/webhook.ts` |
+| `/sources` | Last search sources | `src/handlers/webhook.ts` |
+| `/search <query>` | Force web search | `src/handlers/webhook.ts` |
+| `/export` | Export all data as JSON | `src/handlers/webhook.ts` |
+| `/import` | Import from file | `src/handlers/webhook.ts` |
+| `/insights <text>` | Set user context | `src/handlers/webhook.ts` |
+| `/clear` | Clear history (with confirmation) | `src/handlers/webhook.ts` |
+| `/fact <text>` | Add fact to memory | `src/handlers/webhook.ts` |
+| `/pref <text>` | Add preference | `src/handlers/webhook.ts` |
+| `/goal <text>` | Add goal | `src/handlers/webhook.ts` |
+| `/clearmemory` | Clear long-term memory | `src/handlers/webhook.ts` |
+| `/voice <text>` | Get voice reply | `src/handlers/webhook.ts` |
 
 ## Key Features Implementation
 
-### 1. Context Compression (Line ~598-787)
+### 1. Context Assembly + Compression
+
+Each request is built from:
+1. `chat_summaries` (all summaries)
+2. Last 500 messages from `chat_history`
+3. Current user message
 
 When context exceeds 800K tokens:
 1. Takes 70% of oldest messages
@@ -368,13 +396,13 @@ GOAL: Learning Python
 
 ### 4. File Processing
 
-| Type | Handler Line | Processing |
-|------|--------------|------------|
-| Images | ~1453 | Native Gemini vision |
-| Voice/Audio | ~1422 | Native transcription |
-| Video | ~1440 | Native analysis |
-| PDF | ~1472 | Native Gemini |
-| TXT/MD/DOCX | ~1501 | Text extraction |
+| Type | Handler Module | Processing |
+|------|-----------------|------------|
+| Images | `src/handlers/webhook.ts` | Native Gemini vision |
+| Voice/Audio | `src/handlers/webhook.ts` | Native transcription |
+| Video | `src/handlers/webhook.ts` | Native analysis |
+| PDF | `src/handlers/webhook.ts` | Native Gemini |
+| TXT/MD/DOCX | `src/handlers/webhook.ts` | Text extraction |
 
 ### 5. Rate Limit Handling (Line ~500-507)
 
