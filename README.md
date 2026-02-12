@@ -140,6 +140,15 @@ Set repo secrets in GitHub:
 - `PROACTIVE_URL=https://your-app.vercel.app/api/proactive`
 - `PROACTIVE_CRON_SECRET=<same as Vercel env>`
 
+Optional (recommended for robust inbound batching on Hobby):
+- `FLUSH_URL=https://your-app.vercel.app/api/flush`
+- `FLUSH_TRIGGER_SECRET=<same as Vercel PROACTIVE_CRON_SECRET or dedicated secret>`
+
+This repo includes a ready workflow for flush draining:
+- `.github/workflows/flush-cron.yml`
+- every 1 minute
+- calls `/api/flush` with bearer secret
+
 Manual ping example:
 
 ```bash
@@ -166,10 +175,16 @@ Neuro Copilot Bot is a Telegram assistant with:
 
 1. Telegram sends update to `api/webhook`.
 2. `src/handlers/webhook.ts` validates webhook/auth/user access.
-3. Update is deduplicated (`processed_updates`) and optionally batched (`inbound_events`).
-4. Context is assembled from history + summaries + memory retrieval.
-5. Gemini call is executed via Antigravity OAuth.
-6. Response is stored, optional memory ingestion/compression runs, and response is sent to Telegram.
+3. Message updates are deduplicated and enqueued to `inbound_events`.
+4. Webhook runs per-chat flush cycle (`processInboundQueueForChat`) with lock+cursor semantics.
+5. Context is assembled from history + summaries + memory retrieval, then Gemini is called once per batch.
+6. One final reply is sent to Telegram; optional memory ingestion/compression/signals run after send.
+
+### Current production behavior (stability mode)
+
+- Processing is currently tuned for stable one-by-one replies.
+- Queue/cursor/flush primitives are in place and documented, but multi-message merge behavior is still being tuned.
+- If your priority is uptime and predictable responses, keep this mode enabled.
 
 ### Memory modes
 
@@ -267,6 +282,7 @@ Current test suite covers critical paths:
 - `MEMORY_RETRIEVAL_MODE` (`rag` or `supabase`)
 - `OUTBOUND_SIGNAL_POLICY_MODE` (`llm` or `heuristic`)
 - `SIGNAL_CLASSIFIER_MODE` (`hybrid` or `metadata`)
+- `FLUSH_TRIGGER_SECRET` (optional; defaults to `PROACTIVE_CRON_SECRET`)
 
 ---
 

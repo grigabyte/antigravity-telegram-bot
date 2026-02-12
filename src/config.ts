@@ -11,6 +11,10 @@ export function getProactiveCronSecret(): string {
   return process.env.PROACTIVE_CRON_SECRET || process.env.CRON_SECRET || '';
 }
 
+export function getFlushTriggerSecret(): string {
+  return process.env.FLUSH_TRIGGER_SECRET || getProactiveCronSecret();
+}
+
 export const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 export const CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID!;
@@ -69,10 +73,22 @@ export const REQUEST_TIMEOUTS = {
   youtube: 15000,
 };
 
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
 export const BATCHING = {
-  debounceMs: 6000,
-  maxBatchWindowMs: 45000,
-  pendingLimit: 50,
+  debounceMs: parsePositiveIntEnv('BATCH_DEBOUNCE_MS', 3000),
+  maxBatchWindowMs: parsePositiveIntEnv('BATCH_MAX_WINDOW_MS', 45000),
+  pendingLimit: parsePositiveIntEnv('BATCH_PENDING_LIMIT', 200),
 };
 
 export const DEFAULT_STICKERS = {

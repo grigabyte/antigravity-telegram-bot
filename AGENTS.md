@@ -52,6 +52,7 @@ Optional:
 - `ADMIN_USER_ID`
 - `OPENROUTER_API_KEY`
 - `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`
+- `FLUSH_TRIGGER_SECRET` (if `/api/flush` uses dedicated secret)
 
 ### Step E — Deploy + webhook
 
@@ -83,6 +84,10 @@ Use external scheduler. This repo includes GitHub Actions scheduler:
 Required GitHub repository secrets:
 - `PROACTIVE_URL` (e.g. `https://your-app.vercel.app/api/proactive`)
 - `PROACTIVE_CRON_SECRET`
+
+Optional robust batching drain trigger:
+- `FLUSH_URL` (e.g. `https://your-app.vercel.app/api/flush`)
+- `FLUSH_TRIGGER_SECRET` (or reuse `PROACTIVE_CRON_SECRET`)
 
 ---
 
@@ -166,8 +171,17 @@ This section is intentionally concise but mandatory for safe changes.
 - webhook auth (`TELEGRAM_WEBHOOK_SECRET`)
 - user access gate (`ADMIN_USER_ID`)
 - dedupe (`processed_updates`)
-- batching (`inbound_events`)
-- retrieval + model call + memory updates + telegram response
+- enqueue inbound batch events (`inbound_events`)
+- trigger/execute chat flush worker (`processInboundQueueForChat`)
+
+`api/flush.ts` → `src/handlers/flush.ts` is the explicit flush endpoint:
+- auth (`FLUSH_TRIGGER_SECRET` fallback to `PROACTIVE_CRON_SECRET`)
+- scans pending chat pairs
+- runs one flush cycle per chat with lock+cursor semantics
+
+Current production note:
+- Bot is currently operated in stability mode (predictable one-by-one replies).
+- Flush primitives remain available for controlled rollout of multi-message merge behavior.
 
 ### Memory architecture
 

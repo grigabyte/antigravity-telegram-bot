@@ -1,0 +1,35 @@
+name: Flush Scheduler
+
+on:
+  schedule:
+    - cron: '*/1 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-flush-endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets
+        env:
+          FLUSH_URL: ${{ secrets.FLUSH_URL }}
+          FLUSH_TRIGGER_SECRET: ${{ secrets.FLUSH_TRIGGER_SECRET }}
+        run: |
+          if [ -z "$FLUSH_URL" ]; then
+            echo "Missing FLUSH_URL secret"
+            exit 1
+          fi
+
+          if [ -z "$FLUSH_TRIGGER_SECRET" ]; then
+            echo "Missing FLUSH_TRIGGER_SECRET secret"
+            exit 1
+          fi
+
+      - name: Trigger inbound flush
+        env:
+          FLUSH_URL: ${{ secrets.FLUSH_URL }}
+          FLUSH_TRIGGER_SECRET: ${{ secrets.FLUSH_TRIGGER_SECRET }}
+        run: |
+          curl --fail --show-error --silent -X POST "$FLUSH_URL" \
+            -H "Authorization: Bearer $FLUSH_TRIGGER_SECRET" \
+            -H "Content-Type: application/json" \
+            -d '{"limit":20}'

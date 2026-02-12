@@ -16,6 +16,13 @@ import { parseTextDocument } from '../parsers/documents.js';
 import { extractUrls, fetchUrlContent } from '../parsers/urls.js';
 import { classifyGifSignalAdvanced, classifyStickerSignalAdvanced } from '../semantics/signal-classifier.js';
 
+const EMPTY_USER_EVENT_TEXT = '[Пользователь отправил сообщение без текста.]';
+const UNKNOWN_ATTACHMENT_TEXT = '[Пользователь отправил вложение неподдерживаемого типа.]';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function buildSignalFallback(): InboundEventPayload['signal'] {
   return {
     kind: 'none',
@@ -50,7 +57,11 @@ async function classifyInboundSignal(update: TelegramUpdate): Promise<InboundEve
 
 async function enqueueInboundMessageInternal(
   update: TelegramUpdate,
-  textValue: string
+  textValue: string,
+  options?: {
+    voiceReply?: boolean;
+    forceSearch?: boolean;
+  }
 ): Promise<{ eventTs: number; eventId: number } | null> {
   const message = update.message;
   if (!message) return null;
@@ -59,6 +70,7 @@ async function enqueueInboundMessageInternal(
     messageId: message.message_id,
     date: message.date,
     text: textValue,
+    options,
     mediaGroupId: message.media_group_id,
     attachments: extractAttachments(update),
     sticker: message.sticker
@@ -119,26 +131,49 @@ function extractAttachments(update: TelegramUpdate): InboundAttachment[] {
 
 export async function enqueueInboundMessageWithText(
   update: TelegramUpdate,
-  textOverride: string
+  textOverride: string,
+  options?: {
+    voiceReply?: boolean;
+    forceSearch?: boolean;
+  }
 ): Promise<{ eventTs: number; eventId: number } | null> {
-  return enqueueInboundMessageInternal(update, textOverride);
+  return enqueueInboundMessageInternal(update, textOverride, options);
 }
 
-export async function shouldWaitForBatch(
+export async function collectBatchUpperEventId(
   userId: number,
   chatId: number,
-  currentEventId: number
-): Promise<boolean> {
-  const startTs = Date.now();
-  while (Date.now() - startTs < 1500) {
+  initialEventId: number,
+  options: {
+    debounceMs: number;
+    maxWindowMs: number;
+    pollMs?: number;
+  }
+): Promise<number> {
+  const debounceMs = Math.max(200, options.debounceMs);
+  const maxWindowMs = Math.max(debounceMs, options.maxWindowMs);
+  const pollMs = Math.max(100, options.pollMs ?? Math.min(1000, Math.floor(debounceMs / 3)));
+
+  let upperEventId = initialEventId;
+  let lastEventSeenAt = Date.now();
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < maxWindowMs) {
+    await sleep(pollMs);
     const latest = await getLatestPendingInboundEvent(userId, chatId);
-    if (latest && latest.id > currentEventId) {
-      return true;
+
+    if (latest && latest.id > upperEventId) {
+      upperEventId = latest.id;
+      lastEventSeenAt = Date.now();
+      continue;
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    if (Date.now() - lastEventSeenAt >= debounceMs) {
+      break;
+    }
   }
 
-  return false;
+  return upperEventId;
 }
 
 export async function resolveBatchUpperEventId(
@@ -238,7 +273,7 @@ async function buildPartsForAttachment(attachment: InboundAttachment): Promise<P
     }
   }
 
-  return [{ text: 'Привет' }];
+  return [{ text: UNKNOWN_ATTACHMENT_TEXT }];
 }
 
 function buildHistoryText(events: InboundEventRecord[]): string {
@@ -270,6 +305,10 @@ function buildHistoryText(events: InboundEventRecord[]): string {
       });
       lines.push(attachmentLabels.join(' '));
     }
+  }
+
+  if (lines.length === 0) {
+    return EMPTY_USER_EVENT_TEXT;
   }
 
   return lines.join('\n');
@@ -313,14 +352,17 @@ export async function buildInboundBatch(
   userId: number,
   chatId: number,
   eventId: number,
-  limit: number = 50
+  limit: number = 50,
+  afterEventId: number = 0
 ): Promise<{
   parts: Part[];
   historyText: string;
   replyToMessageId?: number;
   eventIds: number[];
+  voiceReply: boolean;
+  forceSearch: boolean;
 }> {
-  const events = await getPendingInboundEvents(userId, chatId, eventId, limit);
+  const events = await getPendingInboundEvents(userId, chatId, eventId, limit, afterEventId);
   const mergedEvents = mergeMediaGroups(events);
 
   const parts: Part[] = [];
@@ -353,7 +395,7 @@ export async function buildInboundBatch(
   }
 
   if (parts.length === 0) {
-    parts.push({ text: 'Привет' });
+    parts.push({ text: EMPTY_USER_EVENT_TEXT });
   }
 
   return {
@@ -361,6 +403,8 @@ export async function buildInboundBatch(
     historyText: buildHistoryText(mergedEvents),
     replyToMessageId: mergedEvents[mergedEvents.length - 1]?.payload.messageId,
     eventIds: events.map((e) => e.id),
+    voiceReply: mergedEvents.some((event) => event.payload.options?.voiceReply === true),
+    forceSearch: mergedEvents.some((event) => event.payload.options?.forceSearch === true),
   };
 }
 

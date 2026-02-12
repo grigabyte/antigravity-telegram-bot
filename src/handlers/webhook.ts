@@ -3,6 +3,7 @@ import {
   ADMIN_USER_ID,
   BATCHING,
   GEMINI_MODEL,
+  getFlushTriggerSecret,
   MEMORY_RETRIEVAL_MODE,
   NODE_ENV,
   OUTBOUND_SIGNAL_POLICY_MODE,
@@ -16,6 +17,7 @@ import {
   addMemoryItem,
   addToHistory,
   clearInboundEvents,
+  clearProcessedInboundEventsBeforeOrEqual,
   clearHistory,
   clearLongTermMemory,
   clearProactiveJobs,
@@ -24,6 +26,8 @@ import {
   acquireInboundBatchLock,
   getChatSummaries,
   getHistory,
+  getInboundBatchCursor,
+  getLatestPendingInboundEvent,
   getLastSources,
   getLongTermMemory,
   getUserSettings,
@@ -39,6 +43,8 @@ import {
   saveLastSources,
   saveMetric,
   saveUserSettings,
+  setInboundBatchCursor,
+  resetInboundBatchCursor,
   isSupabaseMissingRelationError,
 } from '../db/supabase.js';
 import {
@@ -56,10 +62,10 @@ import { buildSystemPrompt, getContextStatsFromHistory } from '../memory/context
 import { buildContextMessages, maybeCompressContext } from '../memory/compression.js';
 import {
   buildInboundBatch,
+  collectBatchUpperEventId,
   enqueueInboundMessageWithText,
   finalizeInboundBatch,
   resolveBatchUpperEventId,
-  shouldWaitForBatch,
 } from '../telegram/inbound-events.js';
 import { applyDynamicReaction } from '../telegram/reactions.js';
 import { applyDynamicStickerOrGif } from '../telegram/stickers.js';
@@ -70,6 +76,38 @@ import { inferOutboundSignalWithLlm } from '../semantics/signal-policy.js';
 import type { SignalPolicyDecision } from '../types.js';
 import { buildMemoryRagContext, ingestMemoryFromText } from '../memory/rag-memory.js';
 import { buildSupabaseMemoryContext } from '../memory/supabase-memory.js';
+
+const KEYBOARD_TEXT_ALIASES: Record<string, string> = {
+  '📊 Статистика': '/stats',
+  '💾 Экспорт': '/export',
+  '🗑️ Очистить': '/clear',
+};
+
+const KEYBOARD_TEXT_SEARCH = '🔍 Поиск';
+const NO_TEXT_PLACEHOLDER = '[Пользователь отправил сообщение без текста.]';
+const INBOUND_BURST_USER_IDS = new Set<number>();
+
+function runNonCriticalTask(task: () => Promise<void>, label: string): void {
+  void task().catch((error) => {
+    console.warn(`${label} failed:`, sanitizeForLog(String(error)));
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.name === 'AbortError' || error.message.toLowerCase().includes('aborted');
+}
+
+function normalizeKeyboardAlias(text: string): string {
+  return KEYBOARD_TEXT_ALIASES[text] || text;
+}
 
 function getWebhookSecretHeader(req: VercelRequest): string {
   const rawHeader = req.headers['x-telegram-bot-api-secret-token'];
@@ -255,6 +293,382 @@ const ERROR_MESSAGES: Record<string, string> = {
   TIMEOUT: '⏱️ Запрос занял слишком много времени.',
   UNKNOWN: '❌ Произошла ошибка. Попробуй ещё раз.',
 };
+
+export async function processInboundQueueForChat(userId: number, chatId: number): Promise<void> {
+  let typingInterval: NodeJS.Timeout | null = null;
+  let pendingBatchIds: number[] = [];
+  let batchFinalized = false;
+  let lockAcquired = false;
+  let responseSent = false;
+
+  try {
+    const lockWaitStartedAt = Date.now();
+    const lockWaitMaxMs = Math.min(90_000, Math.max(20_000, BATCHING.maxBatchWindowMs + 10_000));
+    while (!lockAcquired && Date.now() - lockWaitStartedAt < lockWaitMaxMs) {
+      lockAcquired = await acquireInboundBatchLock(userId, chatId);
+      if (lockAcquired) {
+        break;
+      }
+      await sleep(1200);
+    }
+
+    if (!lockAcquired) {
+      return;
+    }
+
+    const lastProcessedEventId = await getInboundBatchCursor(userId, chatId);
+    const latestPending = await getLatestPendingInboundEvent(userId, chatId);
+    if (!latestPending || latestPending.id <= lastProcessedEventId) {
+      return;
+    }
+
+    const quietDebounceMs = Math.max(BATCHING.debounceMs, 3500);
+
+    const upperEventIdFromQuietWindow = await collectBatchUpperEventId(userId, chatId, latestPending.id, {
+      debounceMs: quietDebounceMs,
+      maxWindowMs: BATCHING.maxBatchWindowMs,
+    });
+
+    const lateArrivalUpperEventId = await collectBatchUpperEventId(userId, chatId, upperEventIdFromQuietWindow, {
+      debounceMs: Math.min(quietDebounceMs, 2000),
+      maxWindowMs: Math.min(BATCHING.maxBatchWindowMs, 5000),
+      pollMs: 250,
+    });
+
+    typingInterval = startTypingLoop(chatId);
+
+    let upperEventId = await resolveBatchUpperEventId(userId, chatId, lateArrivalUpperEventId);
+    if (upperEventId <= lastProcessedEventId) {
+      return;
+    }
+
+    let batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit, lastProcessedEventId);
+    pendingBatchIds = batch.eventIds;
+
+    if (batch.eventIds.length === 0) {
+      return;
+    }
+
+    const hasBurst = batch.eventIds.length > 1;
+    if (hasBurst) {
+      INBOUND_BURST_USER_IDS.add(userId);
+    }
+
+    let finalResultText = '';
+    let finalResultSources: Array<{ title: string; url: string }> = [];
+    let finalBatchHistoryText = batch.historyText || NO_TEXT_PLACEHOLDER;
+    let finalSignalCandidates: string[] = [];
+    let rebuildCount = 0;
+    const MAX_BATCH_REBUILDS = 6;
+
+    while (true) {
+      const batchHistoryText = batch.historyText || NO_TEXT_PLACEHOLDER;
+
+      const signalCandidates = batch.parts
+        .filter((part) => typeof part.text === 'string' && part.text.includes('[Сигнал '))
+        .map((part) => part.text as string)
+        .slice(0, 5);
+
+      const retrievalStart = Date.now();
+      const memoryContext =
+        MEMORY_RETRIEVAL_MODE === 'supabase'
+          ? await buildSupabaseMemoryContext(userId, batchHistoryText)
+          : await buildMemoryRagContext(userId, batchHistoryText);
+      const retrievalLatency = Date.now() - retrievalStart;
+      await saveMetricSafe(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
+        mode: MEMORY_RETRIEVAL_MODE,
+        hasContext: Boolean(memoryContext),
+      });
+
+      if (memoryContext) {
+        await saveMetricSafe(userId, 'memory_retrieval_hit', 1, {
+          mode: MEMORY_RETRIEVAL_MODE,
+        });
+      }
+
+      const partsForModel = memoryContext
+        ? [...batch.parts, { text: `[Релевантная память:${MEMORY_RETRIEVAL_MODE}]\n${memoryContext}` }]
+        : batch.parts;
+
+      const systemPrompt = await buildSystemPrompt(userId);
+      const contextBundle = await buildContextMessages(
+        userId,
+        { role: 'user', parts: partsForModel },
+        batchHistoryText
+      );
+
+      const modelStart = Date.now();
+      const result = await callGemini({
+        messages: contextBundle.messages,
+        systemPrompt,
+        forceSearch: batch.forceSearch,
+      });
+      const modelLatency = Date.now() - modelStart;
+      await saveMetricSafe(userId, 'model_latency_ms', modelLatency, {
+        model: GEMINI_MODEL,
+        mode: MEMORY_RETRIEVAL_MODE,
+      });
+
+      const refreshedUpperEventId = await resolveBatchUpperEventId(userId, chatId, upperEventId);
+      const hasNewerEvents = refreshedUpperEventId > upperEventId;
+
+      if (hasNewerEvents && rebuildCount < MAX_BATCH_REBUILDS) {
+        upperEventId = refreshedUpperEventId;
+        batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit, lastProcessedEventId);
+        pendingBatchIds = batch.eventIds;
+        rebuildCount += 1;
+
+        if (batch.eventIds.length === 0) {
+          return;
+        }
+
+        continue;
+      }
+
+      const stabilizedUpperEventId = await collectBatchUpperEventId(userId, chatId, upperEventId, {
+        debounceMs: 1200,
+        maxWindowMs: 4000,
+        pollMs: 200,
+      });
+
+      if (stabilizedUpperEventId > upperEventId && rebuildCount < MAX_BATCH_REBUILDS) {
+        upperEventId = stabilizedUpperEventId;
+        batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit, lastProcessedEventId);
+        pendingBatchIds = batch.eventIds;
+        rebuildCount += 1;
+
+        if (batch.eventIds.length === 0) {
+          return;
+        }
+
+        continue;
+      }
+
+      finalResultText = result.text;
+      finalResultSources = result.sources || [];
+      finalBatchHistoryText = batchHistoryText;
+      finalSignalCandidates = signalCandidates;
+      break;
+    }
+
+    let cleanText = finalResultText;
+    const memoryMatch = finalResultText.match(/<memory>([\s\S]*?)<\/memory>/i);
+    if (memoryMatch) {
+      const memoryBlock = memoryMatch[1];
+      cleanText = finalResultText.replace(/<memory>[\s\S]*?<\/memory>/gi, '').trim();
+
+      const factMatch = memoryBlock.match(/FACT:\s*(.+)/gi);
+      const prefMatch = memoryBlock.match(/PREF:\s*(.+)/gi);
+      const goalMatch = memoryBlock.match(/GOAL:\s*(.+)/gi);
+
+      if (factMatch) {
+        for (const f of factMatch) {
+          await addMemoryItem(userId, 'fact', f.replace(/FACT:\s*/i, '').trim());
+        }
+      }
+      if (prefMatch) {
+        for (const p of prefMatch) {
+          await addMemoryItem(userId, 'preference', p.replace(/PREF:\s*/i, '').trim());
+        }
+      }
+      if (goalMatch) {
+        for (const g of goalMatch) {
+          await addMemoryItem(userId, 'goal', g.replace(/GOAL:\s*/i, '').trim());
+        }
+      }
+    }
+
+    cleanText = cleanText.replace(/@@(?:CODEBLOCK|INLINE|TAG)_?\d+@@/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+    if (finalResultSources.length > 0) {
+      await saveLastSources(userId, finalResultSources);
+    }
+
+    await finalizeInboundBatch(batch.eventIds);
+    batchFinalized = true;
+    pendingBatchIds = [];
+
+    const maxProcessedEventId = batch.eventIds.reduce((max, id) => (id > max ? id : max), lastProcessedEventId);
+    await setInboundBatchCursor(userId, chatId, maxProcessedEventId);
+    runNonCriticalTask(
+      async () => {
+        await clearProcessedInboundEventsBeforeOrEqual(userId, chatId, maxProcessedEventId);
+      },
+      'inbound_events_cleanup'
+    );
+
+    await addToHistory(userId, {
+      role: 'user',
+      content: finalBatchHistoryText,
+      timestamp: Date.now(),
+    });
+
+    await addToHistory(userId, { role: 'model', content: cleanText, timestamp: Date.now() });
+
+    const ttsButton = {
+      inline_keyboard: [[{ text: '🔊 Озвучить', callback_data: 'tts:1' }]],
+    };
+
+    await sendTelegram(chatId, cleanText, batch.replyToMessageId, true, ttsButton);
+    responseSent = true;
+
+    runNonCriticalTask(
+      async () => {
+        const compressionResult = await maybeCompressContext(userId);
+        if (compressionResult.compressed) {
+          const memoryNote =
+            compressionResult.factsExtracted > 0
+              ? `, ${compressionResult.factsExtracted} фактов сохранено в память`
+              : '';
+          await sendTelegram(
+            chatId,
+            `📚 Контекст сжат (~${Math.round(compressionResult.tokensFreed / 1000)}K токенов освобождено${memoryNote})`,
+            undefined,
+            true
+          );
+        }
+      },
+      'context_compression'
+    );
+
+    runNonCriticalTask(
+      async () => {
+        for (const signalText of finalSignalCandidates) {
+          await ingestMemoryFromText(userId, 'signal', signalText, {
+            importance: 0.55,
+            confidence: 0.6,
+            sourceMessageId: batch.replyToMessageId,
+            chunkMeta: { source: 'inbound-batch-signal' },
+          });
+        }
+      },
+      'signal_memory_ingest'
+    );
+
+    runNonCriticalTask(
+      async () => {
+        await ingestMemoryFromText(userId, 'episode', `${finalBatchHistoryText}\n\nОтвет бота:\n${cleanText}`, {
+          importance: 0.58,
+          confidence: 0.7,
+          sourceMessageId: batch.replyToMessageId,
+          chunkMeta: { source: 'episode' },
+        });
+      },
+      'episode_memory_ingest'
+    );
+
+    runNonCriticalTask(
+      async () => {
+        const shouldScheduleGoalFollowup = /цель|план|начну|сделаю|задач/i.test(finalBatchHistoryText);
+        if (!shouldScheduleGoalFollowup) {
+          return;
+        }
+
+        const hasPendingGoalFollowup = await hasPendingProactiveJob(userId, 'goal_followup');
+        if (!hasPendingGoalFollowup) {
+          await scheduleProactiveMessage(
+            userId,
+            chatId,
+            Date.now() + 24 * 60 * 60 * 1000,
+            '👋 Как продвигается твоя цель? Если хочешь, помогу сделать следующий шаг сегодня.',
+            'goal_followup'
+          );
+        }
+      },
+      'goal_followup_schedule'
+    );
+
+    runNonCriticalTask(
+      async () => {
+        const skipOutboundSignals = hasBurst || INBOUND_BURST_USER_IDS.has(userId);
+
+        if (skipOutboundSignals) {
+          await saveMetricSafe(userId, 'signal_policy_decision', 0, {
+            mode: OUTBOUND_SIGNAL_POLICY_MODE,
+            kind: 'none',
+            intent: 'none',
+            reason: 'suppressed_for_multi_message_burst',
+          });
+          INBOUND_BURST_USER_IDS.delete(userId);
+          return;
+        }
+
+        const fallbackSignal = inferOutboundSignal(cleanText, finalBatchHistoryText);
+        const outboundSignal: SignalPolicyDecision =
+          OUTBOUND_SIGNAL_POLICY_MODE === 'llm'
+            ? await inferOutboundSignalWithLlm(cleanText, finalBatchHistoryText, fallbackSignal)
+            : {
+                kind: (fallbackSignal.intent === 'none' ? 'none' : 'reaction') as 'none' | 'reaction',
+                emotion: fallbackSignal.emotion,
+                intent: fallbackSignal.intent,
+                confidence: fallbackSignal.confidence,
+                reason: 'heuristic_policy_mode',
+              };
+
+        await saveMetricSafe(userId, 'signal_policy_decision', outboundSignal.confidence, {
+          mode: OUTBOUND_SIGNAL_POLICY_MODE,
+          kind: outboundSignal.kind,
+          intent: outboundSignal.intent,
+          reason: outboundSignal.reason,
+        });
+
+        if (batch.replyToMessageId && outboundSignal.intent !== 'none') {
+          await applyDynamicReaction(userId, chatId, batch.replyToMessageId, outboundSignal);
+          if (outboundSignal.kind === 'sticker' || outboundSignal.kind === 'gif' || outboundSignal.kind === 'reaction') {
+            await applyDynamicStickerOrGif(userId, chatId, batch.replyToMessageId, outboundSignal);
+          }
+        }
+      },
+      'outbound_signals'
+    );
+
+    if (batch.voiceReply) {
+      runNonCriticalTask(
+        async () => {
+          const audioBuffer = await textToSpeech(cleanText);
+          if (audioBuffer) {
+            await sendVoice(chatId, audioBuffer, batch.replyToMessageId);
+          }
+        },
+        'voice_reply'
+      );
+    }
+
+  } catch (error) {
+    if (pendingBatchIds.length > 0 && !batchFinalized) {
+      console.error('Inbound batch failed, kept pending for retry:', pendingBatchIds.join(','));
+    }
+
+    if (isDuplicateUpdateError(error)) {
+      return;
+    }
+
+    if (isAbortError(error)) {
+      console.warn('Webhook batch aborted due to timeout/abort:', sanitizeForLog(String(error)));
+      if (!responseSent) {
+        await sendTelegram(
+          chatId,
+          '⏳ Пачка сообщений ещё обрабатывается. Отправь короткий пинг через пару секунд — отвечу одним сообщением.',
+          undefined,
+          true
+        ).catch(() => {
+          // noop
+        });
+      }
+      return;
+    }
+
+    console.error('Webhook processing error:', sanitizeForLog(String(error)));
+    if (!responseSent) {
+      await notifyErrorSafely(chatId, error);
+    }
+  } finally {
+    if (typingInterval) clearInterval(typingInterval);
+    if (lockAcquired) {
+      await releaseInboundBatchLock(userId, chatId);
+    }
+  }
+}
 
 export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'GET') {
@@ -485,9 +899,10 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
   let pendingBatchIds: number[] = [];
   let batchFinalized = false;
   let lockAcquired = false;
+  let responseSent = false;
 
   try {
-    if (text === '🔍 Поиск') {
+    if (text === KEYBOARD_TEXT_SEARCH) {
       await sendTelegram(
         chatId,
         '🔍 Напиши запрос для поиска:\n<code>/search твой запрос</code>\n\nИли просто задай вопрос — я сам решу, нужен ли поиск.',
@@ -497,17 +912,7 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ ok: true });
     }
 
-    if (text === '📊 Статистика') {
-      text = '/stats';
-    }
-
-    if (text === '💾 Экспорт') {
-      text = '/export';
-    }
-
-    if (text === '🗑️ Очистить') {
-      text = '/clear';
-    }
+    text = normalizeKeyboardAlias(text);
 
     if (text === '/start') {
       await sendTelegram(
@@ -656,6 +1061,13 @@ ${progressBar} ${contextStats.percent}%
         false,
         getConfirmClearKeyboard()
       );
+      return res.status(200).json({ ok: true });
+    }
+
+    if (text === '/batchreset') {
+      await clearInboundEvents(userId);
+      await resetInboundBatchCursor(userId, chatId);
+      await sendTelegram(chatId, '✅ Очередь входящих сообщений сброшена для этого чата.', undefined, true);
       return res.status(200).json({ ok: true });
     }
 
@@ -842,6 +1254,10 @@ ${progressBar} ${contextStats.percent}%
       return res.status(200).json({ ok: true });
     }
 
+    if (text === '[flush]') {
+      return res.status(200).json({ ok: true, worker: true });
+    }
+
     let voiceReply = false;
     if (text.startsWith('/voice ')) {
       text = text.replace('/voice ', '');
@@ -894,253 +1310,24 @@ ${progressBar} ${contextStats.percent}%
       }
     }
 
-    const enqueued = await enqueueInboundMessageWithText(update, text);
+    const enqueued = await enqueueInboundMessageWithText(update, text, {
+      voiceReply,
+      forceSearch,
+    });
     if (!enqueued) {
       return res.status(200).json({ ok: true });
     }
 
-    lockAcquired = await acquireInboundBatchLock(userId, chatId);
-    if (!lockAcquired) {
-      return res.status(200).json({ ok: true, batched: true });
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, BATCHING.debounceMs));
-    while (await shouldWaitForBatch(userId, chatId, enqueued.eventId)) {
-      await new Promise((resolve) => setTimeout(resolve, BATCHING.debounceMs));
-    }
-
-    typingInterval = startTypingLoop(chatId);
-
-    let upperEventId = await resolveBatchUpperEventId(userId, chatId, enqueued.eventId);
-    let batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
-    pendingBatchIds = batch.eventIds;
-    if (batch.eventIds.length === 0) {
-      if (typingInterval) clearInterval(typingInterval);
-      return res.status(200).json({ ok: true });
-    }
-
-    let finalResultText = '';
-    let finalResultSources: Array<{ title: string; url: string }> = [];
-    let finalBatchHistoryText = batch.historyText || (text || 'Привет');
-    let finalSignalCandidates: string[] = [];
-    let rebuildCount = 0;
-    const MAX_BATCH_REBUILDS = 2;
-
-    while (true) {
-      const batchHistoryText = batch.historyText || (text || 'Привет');
-
-      const signalCandidates = batch.parts
-        .filter((part) => typeof part.text === 'string' && part.text.includes('[Сигнал '))
-        .map((part) => part.text as string)
-        .slice(0, 5);
-
-      const retrievalStart = Date.now();
-      const memoryContext =
-        MEMORY_RETRIEVAL_MODE === 'supabase'
-          ? await buildSupabaseMemoryContext(userId, batchHistoryText)
-          : await buildMemoryRagContext(userId, batchHistoryText);
-      const retrievalLatency = Date.now() - retrievalStart;
-      await saveMetricSafe(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
-        mode: MEMORY_RETRIEVAL_MODE,
-        hasContext: Boolean(memoryContext),
-      });
-
-      if (memoryContext) {
-        await saveMetricSafe(userId, 'memory_retrieval_hit', 1, {
-          mode: MEMORY_RETRIEVAL_MODE,
-        });
-      }
-
-      const partsForModel = memoryContext
-        ? [...batch.parts, { text: `[Релевантная память:${MEMORY_RETRIEVAL_MODE}]\n${memoryContext}` }]
-        : batch.parts;
-
-      const systemPrompt = await buildSystemPrompt(userId);
-      const contextBundle = await buildContextMessages(
-        userId,
-        { role: 'user', parts: partsForModel },
-        batchHistoryText
-      );
-      const modelStart = Date.now();
-      const result = await callGemini({
-        messages: contextBundle.messages,
-        systemPrompt,
-        forceSearch,
-      });
-      const modelLatency = Date.now() - modelStart;
-      await saveMetricSafe(userId, 'model_latency_ms', modelLatency, {
-        model: GEMINI_MODEL,
-        mode: MEMORY_RETRIEVAL_MODE,
-      });
-
-      const refreshedUpperEventId = await resolveBatchUpperEventId(userId, chatId, upperEventId);
-      const hasNewerEvents = refreshedUpperEventId > upperEventId;
-
-      if (hasNewerEvents && rebuildCount < MAX_BATCH_REBUILDS) {
-        upperEventId = refreshedUpperEventId;
-        batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
-        pendingBatchIds = batch.eventIds;
-        rebuildCount += 1;
-
-        if (batch.eventIds.length === 0) {
-          if (typingInterval) clearInterval(typingInterval);
-          return res.status(200).json({ ok: true });
-        }
-
-        continue;
-      }
-
-      finalResultText = result.text;
-      finalResultSources = result.sources || [];
-      finalBatchHistoryText = batchHistoryText;
-      finalSignalCandidates = signalCandidates;
-      break;
-    }
-
-    let cleanText = finalResultText;
-    const memoryMatch = finalResultText.match(/<memory>([\s\S]*?)<\/memory>/i);
-    if (memoryMatch) {
-      const memoryBlock = memoryMatch[1];
-      cleanText = finalResultText.replace(/<memory>[\s\S]*?<\/memory>/gi, '').trim();
-
-      const factMatch = memoryBlock.match(/FACT:\s*(.+)/gi);
-      const prefMatch = memoryBlock.match(/PREF:\s*(.+)/gi);
-      const goalMatch = memoryBlock.match(/GOAL:\s*(.+)/gi);
-
-      if (factMatch) {
-        for (const f of factMatch) {
-          await addMemoryItem(userId, 'fact', f.replace(/FACT:\s*/i, '').trim());
-        }
-      }
-      if (prefMatch) {
-        for (const p of prefMatch) {
-          await addMemoryItem(userId, 'preference', p.replace(/PREF:\s*/i, '').trim());
-        }
-      }
-      if (goalMatch) {
-        for (const g of goalMatch) {
-          await addMemoryItem(userId, 'goal', g.replace(/GOAL:\s*/i, '').trim());
-        }
-      }
-    }
-
-    if (finalResultSources.length > 0) {
-      await saveLastSources(userId, finalResultSources);
-    }
-
-    await finalizeInboundBatch(batch.eventIds);
-    batchFinalized = true;
-    pendingBatchIds = [];
-
-    for (const signalText of finalSignalCandidates) {
-      await ingestMemoryFromText(userId, 'signal', signalText, {
-        importance: 0.55,
-        confidence: 0.6,
-        sourceMessageId: batch.replyToMessageId,
-        chunkMeta: { source: 'inbound-batch-signal' },
-      });
-    }
-
-    await addToHistory(userId, {
-      role: 'user',
-      content: finalBatchHistoryText,
-      timestamp: Date.now(),
-    });
-
-    await addToHistory(userId, { role: 'model', content: cleanText, timestamp: Date.now() });
-
-    await ingestMemoryFromText(userId, 'episode', `${finalBatchHistoryText}\n\nОтвет бота:\n${cleanText}`, {
-      importance: 0.58,
-      confidence: 0.7,
-      sourceMessageId: batch.replyToMessageId,
-      chunkMeta: { source: 'episode' },
-    });
-
-    const shouldScheduleGoalFollowup = /цель|план|начну|сделаю|задач/i.test(finalBatchHistoryText);
-    if (shouldScheduleGoalFollowup) {
-      const hasPendingGoalFollowup = await hasPendingProactiveJob(userId, 'goal_followup');
-      if (!hasPendingGoalFollowup) {
-        await scheduleProactiveMessage(
-          userId,
-          chatId,
-          Date.now() + 24 * 60 * 60 * 1000,
-          '👋 Как продвигается твоя цель? Если хочешь, помогу сделать следующий шаг сегодня.',
-          'goal_followup'
-        );
-      }
-    }
-
-    const compressionResult = await maybeCompressContext(userId);
-
-    if (typingInterval) clearInterval(typingInterval);
-
-    const ttsButton = {
-      inline_keyboard: [[{ text: '🔊 Озвучить', callback_data: 'tts:1' }]],
-    };
-
-    if (compressionResult.compressed) {
-      const memoryNote =
-        compressionResult.factsExtracted > 0
-          ? `, ${compressionResult.factsExtracted} фактов сохранено в память`
-          : '';
-      await sendTelegram(
-        chatId,
-        cleanText + `\n\n<i>📚 Контекст сжат (~${Math.round(compressionResult.tokensFreed / 1000)}K токенов освобождено${memoryNote})</i>`,
-        batch.replyToMessageId,
-        true,
-        ttsButton
-      );
-    } else {
-      await sendTelegram(chatId, cleanText, batch.replyToMessageId, true, ttsButton);
-    }
-
-    const fallbackSignal = inferOutboundSignal(cleanText, finalBatchHistoryText);
-    const outboundSignal: SignalPolicyDecision =
-      OUTBOUND_SIGNAL_POLICY_MODE === 'llm'
-        ? await inferOutboundSignalWithLlm(cleanText, finalBatchHistoryText, fallbackSignal)
-        : {
-            kind: (fallbackSignal.intent === 'none' ? 'none' : 'reaction') as 'none' | 'reaction',
-            emotion: fallbackSignal.emotion,
-            intent: fallbackSignal.intent,
-            confidence: fallbackSignal.confidence,
-            reason: 'heuristic_policy_mode',
-          };
-
-    await saveMetricSafe(userId, 'signal_policy_decision', outboundSignal.confidence, {
-      mode: OUTBOUND_SIGNAL_POLICY_MODE,
-      kind: outboundSignal.kind,
-      intent: outboundSignal.intent,
-      reason: outboundSignal.reason,
-    });
-
-    if (batch.replyToMessageId && outboundSignal.intent !== 'none') {
-      await applyDynamicReaction(userId, chatId, batch.replyToMessageId, outboundSignal);
-      if (outboundSignal.kind === 'sticker' || outboundSignal.kind === 'gif' || outboundSignal.kind === 'reaction') {
-        await applyDynamicStickerOrGif(userId, chatId, batch.replyToMessageId, outboundSignal);
-      }
-    }
-
-    if (voiceReply) {
-      const audioBuffer = await textToSpeech(cleanText);
-      if (audioBuffer) {
-        await sendVoice(chatId, audioBuffer, batch.replyToMessageId);
-      }
-    }
+    await processInboundQueueForChat(userId, chatId);
+    return res.status(200).json({ ok: true });
 
   } catch (error) {
-    if (typingInterval) clearInterval(typingInterval);
-    if (pendingBatchIds.length > 0 && !batchFinalized) {
-      console.error('Inbound batch failed, kept pending for retry:', pendingBatchIds.join(','));
-    }
     if (isDuplicateUpdateError(error)) {
       return res.status(200).json({ ok: true, duplicate: true });
     }
+
     console.error('Webhook processing error:', sanitizeForLog(String(error)));
     await notifyErrorSafely(chatId, error);
-  } finally {
-    if (lockAcquired) {
-      await releaseInboundBatchLock(userId, chatId);
-    }
   }
 
   return res.status(200).json({ ok: true });

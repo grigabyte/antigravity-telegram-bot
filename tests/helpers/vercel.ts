@@ -3,6 +3,7 @@ type JsonValue = Record<string, unknown> | Array<unknown> | string | number | bo
 export interface MockVercelResponse {
   statusCode: number;
   body: JsonValue | null;
+  headersSent: boolean;
   status: (code: number) => MockVercelResponse;
   json: (payload: JsonValue) => MockVercelResponse;
 }
@@ -11,12 +12,14 @@ export function createMockVercelResponse(): MockVercelResponse {
   return {
     statusCode: 200,
     body: null,
+    headersSent: false,
     status(code: number) {
       this.statusCode = code;
       return this;
     },
     json(payload: JsonValue) {
       this.body = payload;
+       this.headersSent = true;
       return this;
     },
   };

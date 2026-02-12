@@ -112,6 +112,10 @@ export interface InboundEventPayload {
   messageId: number;
   date: number;
   text: string;
+  options?: {
+    voiceReply?: boolean;
+    forceSearch?: boolean;
+  };
   mediaGroupId?: string;
   attachments: InboundAttachment[];
   sticker?: {

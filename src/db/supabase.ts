@@ -553,7 +553,8 @@ export async function getPendingInboundEvents(
   userId: number,
   chatId: number,
   beforeId: number,
-  limit: number = 50
+  limit: number = 50,
+  afterId: number = 0
 ): Promise<InboundEventRecord[]> {
   let data: any[] | null = null;
   try {
@@ -561,7 +562,7 @@ export async function getPendingInboundEvents(
       'inbound_events',
       'GET',
       null,
-      `?user_id=eq.${userId}&chat_id=eq.${chatId}&processed=eq.false&id=lte.${beforeId}&order=id.asc&limit=${limit}`
+      `?user_id=eq.${userId}&chat_id=eq.${chatId}&processed=eq.false&id=gt.${afterId}&id=lte.${beforeId}&order=id.desc&limit=${limit}`
     );
   } catch (error) {
     if (shouldIgnoreMissingRelation(error, 'inbound_events')) {
@@ -570,14 +571,16 @@ export async function getPendingInboundEvents(
     throw error;
   }
 
-  return (data || []).map((row: any) => ({
-    id: row.id,
-    user_id: row.user_id,
-    chat_id: row.chat_id,
-    event_ts: row.event_ts,
-    payload: row.payload,
-    processed: row.processed,
-  }));
+  return (data || [])
+    .map((row: any) => ({
+      id: row.id,
+      user_id: row.user_id,
+      chat_id: row.chat_id,
+      event_ts: row.event_ts,
+      payload: row.payload,
+      processed: row.processed,
+    }))
+    .sort((a, b) => a.id - b.id);
 }
 
 export async function markInboundEventsProcessed(ids: number[]): Promise<void> {
@@ -619,9 +622,65 @@ export async function getLatestPendingInboundEvent(
   return { id: first.id, eventTs: first.event_ts };
 }
 
+export async function getPendingInboundChatPairs(limit: number = 20): Promise<Array<{ userId: number; chatId: number }>> {
+  let rows: Array<{ user_id: number; chat_id: number }> | null = null;
+  try {
+    rows = await supabaseQuery(
+      'inbound_events',
+      'GET',
+      null,
+      `?processed=eq.false&select=user_id,chat_id&order=id.desc&limit=${limit}`
+    );
+  } catch (error) {
+    if (shouldIgnoreMissingRelation(error, 'inbound_events')) {
+      return [];
+    }
+    throw error;
+  }
+
+  const unique = new Map<string, { userId: number; chatId: number }>();
+  for (const row of rows || []) {
+    const userId = Number(row.user_id);
+    const chatId = Number(row.chat_id);
+    if (!Number.isFinite(userId) || !Number.isFinite(chatId) || userId <= 0 || chatId <= 0) {
+      continue;
+    }
+    const key = `${userId}:${chatId}`;
+    if (!unique.has(key)) {
+      unique.set(key, { userId, chatId });
+    }
+  }
+
+  return Array.from(unique.values());
+}
+
 export async function clearInboundEvents(userId: number): Promise<void> {
   try {
     await supabaseQuery('inbound_events', 'DELETE', null, `?user_id=eq.${userId}`);
+  } catch (error) {
+    if (shouldIgnoreMissingRelation(error, 'inbound_events')) {
+      return;
+    }
+    throw error;
+  }
+}
+
+export async function clearProcessedInboundEventsBeforeOrEqual(
+  userId: number,
+  chatId: number,
+  maxEventIdInclusive: number
+): Promise<void> {
+  if (!Number.isFinite(maxEventIdInclusive) || maxEventIdInclusive <= 0) {
+    return;
+  }
+
+  try {
+    await supabaseQuery(
+      'inbound_events',
+      'DELETE',
+      null,
+      `?user_id=eq.${userId}&chat_id=eq.${chatId}&processed=eq.true&id=lte.${maxEventIdInclusive}`
+    );
   } catch (error) {
     if (shouldIgnoreMissingRelation(error, 'inbound_events')) {
       return;
@@ -1081,6 +1140,88 @@ export async function markUpdateProcessed(
 const BATCH_LOCK_UPDATE_ID = 0;
 const BATCH_LOCK_TYPE = 'batch_lock';
 const BATCH_LOCK_TTL_MS = 2 * 60 * 1000;
+const BATCH_CURSOR_TYPE = 'batch_cursor';
+
+export async function getInboundBatchCursor(userId: number, chatId: number): Promise<number> {
+  if (chatId <= 0 || userId <= 0) {
+    return 0;
+  }
+
+  let rows: any[] | null = null;
+  try {
+    rows = await supabaseQuery(
+      'processed_updates',
+      'GET',
+      null,
+      `?user_id=eq.${userId}&chat_id=eq.${chatId}&update_type=eq.${BATCH_CURSOR_TYPE}&order=update_id.desc&limit=1&select=update_id`
+    );
+  } catch (error) {
+    if (shouldIgnoreMissingRelation(error, 'processed_updates')) {
+      throw new Error('DEDUPE_UNAVAILABLE');
+    }
+    throw error;
+  }
+
+  const first = Array.isArray(rows) ? rows[0] : null;
+  const updateId = Number(first?.update_id);
+  if (!Number.isFinite(updateId) || updateId <= 0) {
+    return 0;
+  }
+  return updateId;
+}
+
+export async function setInboundBatchCursor(userId: number, chatId: number, lastProcessedEventId: number): Promise<void> {
+  if (chatId <= 0 || userId <= 0 || !Number.isFinite(lastProcessedEventId) || lastProcessedEventId <= 0) {
+    return;
+  }
+
+  await supabaseQuery(
+    'processed_updates',
+    'DELETE',
+    null,
+    `?user_id=eq.${userId}&chat_id=eq.${chatId}&update_type=eq.${BATCH_CURSOR_TYPE}`
+  ).catch((error) => {
+    if (shouldIgnoreMissingRelation(error, 'processed_updates')) {
+      throw new Error('DEDUPE_UNAVAILABLE');
+    }
+    throw error;
+  });
+
+  try {
+    await supabaseQuery('processed_updates', 'POST', {
+      update_id: lastProcessedEventId,
+      user_id: userId,
+      chat_id: chatId,
+      update_type: BATCH_CURSOR_TYPE,
+      processed_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (shouldIgnoreMissingRelation(error, 'processed_updates')) {
+      throw new Error('DEDUPE_UNAVAILABLE');
+    }
+    throw error;
+  }
+}
+
+export async function resetInboundBatchCursor(userId: number, chatId: number): Promise<void> {
+  if (chatId <= 0 || userId <= 0) {
+    return;
+  }
+
+  try {
+    await supabaseQuery(
+      'processed_updates',
+      'DELETE',
+      null,
+      `?user_id=eq.${userId}&chat_id=eq.${chatId}&update_type=eq.${BATCH_CURSOR_TYPE}`
+    );
+  } catch (error) {
+    if (shouldIgnoreMissingRelation(error, 'processed_updates')) {
+      throw new Error('DEDUPE_UNAVAILABLE');
+    }
+    throw error;
+  }
+}
 
 export async function acquireInboundBatchLock(userId: number, chatId: number): Promise<boolean> {
   if (chatId <= 0 || userId <= 0) {
