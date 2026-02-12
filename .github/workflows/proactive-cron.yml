@@ -1,0 +1,34 @@
+name: Proactive Scheduler
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-proactive-endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets
+        env:
+          PROACTIVE_URL: ${{ secrets.PROACTIVE_URL }}
+          PROACTIVE_CRON_SECRET: ${{ secrets.PROACTIVE_CRON_SECRET }}
+        run: |
+          if [ -z "$PROACTIVE_URL" ]; then
+            echo "Missing PROACTIVE_URL secret"
+            exit 1
+          fi
+
+          if [ -z "$PROACTIVE_CRON_SECRET" ]; then
+            echo "Missing PROACTIVE_CRON_SECRET secret"
+            exit 1
+          fi
+
+      - name: Trigger proactive jobs
+        env:
+          PROACTIVE_URL: ${{ secrets.PROACTIVE_URL }}
+          PROACTIVE_CRON_SECRET: ${{ secrets.PROACTIVE_CRON_SECRET }}
+        run: |
+          curl --fail --show-error --silent -X POST "$PROACTIVE_URL" \
+            -H "Authorization: Bearer $PROACTIVE_CRON_SECRET" \
+            -H "Content-Type: application/json"

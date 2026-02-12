@@ -423,6 +423,13 @@ Vercel Hobby limits native Cron to once per day. For more frequent proactive run
 2. **External scheduler**: Keep Hobby, disable Vercel Cron, and call `/api/proactive` every 5-15 minutes from an external cron service
    (GitHub Actions, cron-job.org, UptimeRobot, etc.) with `Authorization: Bearer <PROACTIVE_CRON_SECRET>`.
 
+This repository includes a ready-to-use GitHub Actions cron workflow:
+- file: `.github/workflows/proactive-cron.yml`
+- schedule: every 15 minutes
+- required repository secrets:
+  - `PROACTIVE_URL` = `https://your-app.vercel.app/api/proactive`
+  - `PROACTIVE_CRON_SECRET` = same secret configured in Vercel env
+
 Example external call:
 
 ```bash
