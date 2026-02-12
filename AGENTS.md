@@ -153,3 +153,58 @@ Critical tests cover:
 - webhook unauthorized → check `TELEGRAM_WEBHOOK_SECRET` and reset webhook
 - `schema: partial` → apply missing SQL scripts
 - deploy output errors on Vercel → verify `vercel.json` + project settings
+
+---
+
+## 8) Critical Architecture Context for Agents
+
+This section is intentionally concise but mandatory for safe changes.
+
+### Request pipeline
+
+`api/webhook.ts` → `src/handlers/webhook.ts` is the core pipeline:
+- webhook auth (`TELEGRAM_WEBHOOK_SECRET`)
+- user access gate (`ADMIN_USER_ID`)
+- dedupe (`processed_updates`)
+- batching (`inbound_events`)
+- retrieval + model call + memory updates + telegram response
+
+### Memory architecture
+
+Memory retrieval mode is selected by `MEMORY_RETRIEVAL_MODE` (`src/config.ts`):
+
+1. **RAG mode** (`rag`)
+   - module: `src/memory/rag-memory.ts`
+   - storage: `memory_items_v2` + `memory_chunks` + `match_memory_chunks`
+   - embeddings path: `src/memory/embeddings.ts`
+
+2. **Supabase lexical mode** (`supabase`)
+   - module: `src/memory/supabase-memory.ts`
+   - retrieval over recent history/signals with lexical + recency scoring
+   - designed as low-cost fallback path
+
+Both modes are production paths. Do not remove either path without explicit migration plan.
+
+### Persistence boundaries
+
+`src/db/supabase.ts` is the only DB boundary for app logic.
+Keep new SQL/schema assumptions aligned with:
+- `scripts/setup-supabase.sql` (core)
+- `scripts/setup-batching-and-proactive.sql` (batch/proactive/dedupe)
+- `scripts/setup-advanced-memory-and-signals.sql` (RAG/signals/metrics)
+
+### Proactive architecture
+
+- endpoint: `api/proactive.ts`
+- scheduler core: `src/proactive/scheduler.ts`
+- auth: `PROACTIVE_CRON_SECRET`
+- deployment modes:
+  - Hobby: external scheduler (GitHub Actions workflow in repo)
+  - Pro: optional native Vercel Cron
+
+### Safety invariants
+
+- Never bypass webhook/proactive secret checks.
+- Never remove dedupe behavior.
+- Keep import operations rollback-safe.
+- Keep `pin/unpin` user-scoped (no cross-user updates).

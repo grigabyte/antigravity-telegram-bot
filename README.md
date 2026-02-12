@@ -149,6 +149,58 @@ curl -X POST "https://your-app.vercel.app/api/proactive" \
 
 ---
 
+## Project Overview
+
+Neuro Copilot Bot is a Telegram assistant with:
+- Gemini 3 Pro via Antigravity OAuth
+- long-running conversational context with compression
+- two memory retrieval modes (`rag` and `supabase`)
+- media processing (voice/audio/video/images/documents)
+- proactive reminders and signal-aware reactions/stickers/GIF behavior
+
+---
+
+## Architecture (important)
+
+### Runtime flow (high-level)
+
+1. Telegram sends update to `api/webhook`.
+2. `src/handlers/webhook.ts` validates webhook/auth/user access.
+3. Update is deduplicated (`processed_updates`) and optionally batched (`inbound_events`).
+4. Context is assembled from history + summaries + memory retrieval.
+5. Gemini call is executed via Antigravity OAuth.
+6. Response is stored, optional memory ingestion/compression runs, and response is sent to Telegram.
+
+### Memory modes
+
+`MEMORY_RETRIEVAL_MODE` controls retrieval strategy:
+
+| Mode | Module | How it works | Cost profile | Best for |
+|---|---|---|---|---|
+| `rag` | `src/memory/rag-memory.ts` | Embeds query + vector search over `memory_chunks` / `memory_items_v2` | Uses embeddings provider | Highest semantic recall |
+| `supabase` | `src/memory/supabase-memory.ts` | Lexical + recency scoring over recent history + signals | No embeddings dependency | Low-cost/free fallback |
+
+Notes:
+- Bot can switch modes without destructive migration.
+- RAG ingestion is best-effort and safe-fallback aware.
+
+### Context/compression model
+
+- Context assembly: `src/memory/context.ts` + `src/memory/compression.ts`
+- When token usage grows, older history is summarized into `chat_summaries`.
+- Useful facts/preferences/goals can be extracted into long-term memory.
+
+### Core modules map
+
+- `api/webhook.ts` / `src/handlers/webhook.ts` — main orchestration
+- `src/ai/gemini.ts` — OAuth token flow + Gemini calls
+- `src/db/supabase.ts` — persistence layer + schema readiness + dedupe helpers
+- `src/memory/*` — memory retrieval, ingestion, compression
+- `src/telegram/*` — Telegram API client, batching, files, formatting, reactions/stickers
+- `api/proactive.ts` + `src/proactive/scheduler.ts` — proactive endpoint + scheduler logic
+
+---
+
 ## Commands
 
 | Command | Description |
