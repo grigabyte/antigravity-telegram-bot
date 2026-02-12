@@ -1078,6 +1078,61 @@ export async function markUpdateProcessed(
   }
 }
 
+const BATCH_LOCK_UPDATE_ID = 0;
+const BATCH_LOCK_TYPE = 'batch_lock';
+const BATCH_LOCK_TTL_MS = 2 * 60 * 1000;
+
+export async function acquireInboundBatchLock(userId: number, chatId: number): Promise<boolean> {
+  if (chatId <= 0 || userId <= 0) {
+    return false;
+  }
+
+  const staleThresholdIso = new Date(Date.now() - BATCH_LOCK_TTL_MS).toISOString();
+
+  await supabaseQuery(
+    'processed_updates',
+    'DELETE',
+    null,
+    `?update_id=eq.${BATCH_LOCK_UPDATE_ID}&user_id=eq.${userId}&chat_id=eq.${chatId}&update_type=eq.${BATCH_LOCK_TYPE}&processed_at=lt.${encodeURIComponent(staleThresholdIso)}`
+  ).catch(() => {
+    // best-effort stale lock cleanup
+  });
+
+  try {
+    await supabaseQuery('processed_updates', 'POST', {
+      update_id: BATCH_LOCK_UPDATE_ID,
+      user_id: userId,
+      chat_id: chatId,
+      update_type: BATCH_LOCK_TYPE,
+      processed_at: new Date().toISOString(),
+    });
+    return true;
+  } catch (error) {
+    if (isDuplicateKeyError(error)) {
+      return false;
+    }
+    if (shouldIgnoreMissingRelation(error, 'processed_updates')) {
+      throw new Error('DEDUPE_UNAVAILABLE');
+    }
+    throw error;
+  }
+}
+
+export async function releaseInboundBatchLock(userId: number, chatId: number): Promise<void> {
+  if (chatId <= 0 || userId <= 0) {
+    return;
+  }
+
+  await supabaseQuery(
+    'processed_updates',
+    'DELETE',
+    null,
+    `?update_id=eq.${BATCH_LOCK_UPDATE_ID}&user_id=eq.${userId}&chat_id=eq.${chatId}&update_type=eq.${BATCH_LOCK_TYPE}`
+  ).catch(() => {
+    // best-effort unlock
+  });
+}
+
 export async function isSchemaReady(): Promise<{ ok: boolean; missing: string[] }> {
   const requiredRelations = ['chat_history', 'long_term_memory', 'user_settings', 'chat_summaries'];
   const optionalRelations = [

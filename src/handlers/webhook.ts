@@ -21,6 +21,7 @@ import {
   clearProactiveJobs,
   clearChatSummaries,
   countPendingProactiveJobs,
+  acquireInboundBatchLock,
   getChatSummaries,
   getHistory,
   getLastSources,
@@ -30,6 +31,7 @@ import {
   markUpdateProcessed,
   replaceHistorySafely,
   replaceLongTermMemorySafely,
+  releaseInboundBatchLock,
   saveMessageSignal,
   setMemoryPinned,
   setUserQuietHours,
@@ -482,6 +484,7 @@ export async function webhookHandler(req: VercelRequest, res: VercelResponse) {
   let typingInterval: NodeJS.Timeout | null = null;
   let pendingBatchIds: number[] = [];
   let batchFinalized = false;
+  let lockAcquired = false;
 
   try {
     if (text === '🔍 Поиск') {
@@ -896,9 +899,14 @@ ${progressBar} ${contextStats.percent}%
       return res.status(200).json({ ok: true });
     }
 
+    lockAcquired = await acquireInboundBatchLock(userId, chatId);
+    if (!lockAcquired) {
+      return res.status(200).json({ ok: true, batched: true });
+    }
+
     await new Promise((resolve) => setTimeout(resolve, BATCHING.debounceMs));
-    if (await shouldWaitForBatch(userId, chatId, enqueued.eventId)) {
-      return res.status(200).json({ ok: true });
+    while (await shouldWaitForBatch(userId, chatId, enqueued.eventId)) {
+      await new Promise((resolve) => setTimeout(resolve, BATCHING.debounceMs));
     }
 
     typingInterval = startTypingLoop(chatId);
@@ -1129,6 +1137,10 @@ ${progressBar} ${contextStats.percent}%
     }
     console.error('Webhook processing error:', sanitizeForLog(String(error)));
     await notifyErrorSafely(chatId, error);
+  } finally {
+    if (lockAcquired) {
+      await releaseInboundBatchLock(userId, chatId);
+    }
   }
 
   return res.status(200).json({ ok: true });
