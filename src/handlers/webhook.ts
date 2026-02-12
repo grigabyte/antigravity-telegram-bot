@@ -56,6 +56,7 @@ import {
   buildInboundBatch,
   enqueueInboundMessageWithText,
   finalizeInboundBatch,
+  resolveBatchUpperEventId,
   shouldWaitForBatch,
 } from '../telegram/inbound-events.js';
 import { applyDynamicReaction } from '../telegram/reactions.js';
@@ -902,7 +903,8 @@ ${progressBar} ${contextStats.percent}%
 
     typingInterval = startTypingLoop(chatId);
 
-    const batch = await buildInboundBatch(userId, chatId, enqueued.eventId, BATCHING.pendingLimit);
+    const upperEventId = await resolveBatchUpperEventId(userId, chatId, enqueued.eventId);
+    const batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
     pendingBatchIds = batch.eventIds;
     if (batch.eventIds.length === 0) {
       if (typingInterval) clearInterval(typingInterval);

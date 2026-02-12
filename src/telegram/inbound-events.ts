@@ -129,10 +129,26 @@ export async function shouldWaitForBatch(
   chatId: number,
   currentEventId: number
 ): Promise<boolean> {
-  const latest = await getLatestPendingInboundEvent(userId, chatId);
-  if (!latest) return false;
+  const startTs = Date.now();
+  while (Date.now() - startTs < 1500) {
+    const latest = await getLatestPendingInboundEvent(userId, chatId);
+    if (latest && latest.id > currentEventId) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 
-  return latest.id > currentEventId;
+  return false;
+}
+
+export async function resolveBatchUpperEventId(
+  userId: number,
+  chatId: number,
+  fallbackEventId: number
+): Promise<number> {
+  const latest = await getLatestPendingInboundEvent(userId, chatId);
+  if (!latest) return fallbackEventId;
+  return Math.max(fallbackEventId, latest.id);
 }
 
 function normalizeStickerText(event: InboundEventRecord): string | null {
