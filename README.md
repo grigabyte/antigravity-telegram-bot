@@ -415,6 +415,21 @@ Both modes are compatible with the same data model. You can switch between them 
 - Set `PROACTIVE_CRON_SECRET` and send it to `/api/proactive` as `Authorization: Bearer <secret>` (or `x-cron-secret`).
 - Do not deploy without these secrets in production.
 
+### Proactive scheduling on Vercel Hobby
+
+Vercel Hobby limits native Cron to once per day. For more frequent proactive runs, use one of these options:
+
+1. **Recommended**: Upgrade to Vercel Pro and keep native `*/15 * * * *` schedule.
+2. **External scheduler**: Keep Hobby, disable Vercel Cron, and call `/api/proactive` every 5-15 minutes from an external cron service
+   (GitHub Actions, cron-job.org, UptimeRobot, etc.) with `Authorization: Bearer <PROACTIVE_CRON_SECRET>`.
+
+Example external call:
+
+```bash
+curl -X POST "https://your-app.vercel.app/api/proactive" \
+  -H "Authorization: Bearer YOUR_PROACTIVE_CRON_SECRET"
+```
+
 ---
 
 ## Project Structure

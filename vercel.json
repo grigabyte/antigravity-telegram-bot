@@ -1,9 +1,4 @@
 {
   "version": 2,
-  "crons": [
-    {
-      "path": "/api/proactive",
-      "schedule": "*/15 * * * *"
-    }
-  ]
+  "crons": []
 }
