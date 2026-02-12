@@ -592,6 +592,21 @@ Bot automatically extracts user information:
 | Timeout errors | Response takes >300s | Try shorter messages |
 | TTS not working | Missing API key | Add `ELEVENLABS_API_KEY` |
 
+### Running tests
+
+```bash
+npm test
+```
+
+The test suite covers critical security and reliability paths:
+- webhook secret validation
+- proactive endpoint authorization
+- update deduplication behavior
+- pin/unpin ownership protection
+- import rollback safety checks
+- SSRF/url-guard sanity checks
+- network timeout behavior
+
 ### Check Webhook Status
 
 ```bash

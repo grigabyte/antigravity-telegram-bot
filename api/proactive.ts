@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { PROACTIVE_CRON_SECRET } from '../src/config.js';
+import { getProactiveCronSecret } from '../src/config.js';
 import { runDueProactiveJobs } from '../src/proactive/scheduler.js';
 
 function extractAuthToken(req: VercelRequest): string {
@@ -21,7 +21,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const expectedSecret = PROACTIVE_CRON_SECRET.trim();
+  const expectedSecret = getProactiveCronSecret().trim();
   if (!expectedSecret && process.env.NODE_ENV === 'production') {
     return res.status(500).json({ ok: false, error: 'cron_secret_not_configured' });
   }

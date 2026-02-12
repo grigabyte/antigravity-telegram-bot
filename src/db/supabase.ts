@@ -376,6 +376,31 @@ export async function addMemoryItem(
   });
 }
 
+function dedupeMemoryValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    deduped.push(trimmed);
+  }
+
+  return deduped;
+}
+
+function assertNoDuplicateLongTermMemory(memory: { facts: string[]; preferences: string[]; goals: string[] }): void {
+  const facts = dedupeMemoryValues(memory.facts);
+  const preferences = dedupeMemoryValues(memory.preferences);
+  const goals = dedupeMemoryValues(memory.goals);
+
+  if (facts.length !== memory.facts.length || preferences.length !== memory.preferences.length || goals.length !== memory.goals.length) {
+    throw new Error('LONG_TERM_MEMORY_DUPLICATES_DETECTED');
+  }
+}
+
 export async function clearLongTermMemory(userId: number): Promise<void> {
   await supabaseQuery('long_term_memory', 'DELETE', null, `?user_id=eq.${userId}`);
 }
@@ -384,6 +409,8 @@ export async function replaceLongTermMemorySafely(
   userId: number,
   memory: { facts: string[]; preferences: string[]; goals: string[] }
 ): Promise<void> {
+  assertNoDuplicateLongTermMemory(memory);
+
   const backup = await getLongTermMemory(userId);
 
   await clearLongTermMemory(userId);

@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 \"dist/tests/**/*.test.js\"",
     "deploy": "vercel --prod",
     "set-webhook": "node scripts/set-webhook.js"
   },

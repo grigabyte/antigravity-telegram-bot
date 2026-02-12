@@ -7,6 +7,10 @@ export const SUPABASE_KEY = process.env.SUPABASE_KEY!;
 export const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 export const PROACTIVE_CRON_SECRET = process.env.PROACTIVE_CRON_SECRET || process.env.CRON_SECRET || '';
 
+export function getProactiveCronSecret(): string {
+  return process.env.PROACTIVE_CRON_SECRET || process.env.CRON_SECRET || '';
+}
+
 export const TELEGRAM_API_BASE = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 export const CLIENT_ID = process.env.ANTIGRAVITY_CLIENT_ID!;
