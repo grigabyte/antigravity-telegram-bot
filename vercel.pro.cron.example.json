@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "outputDirectory": ".",
+  "crons": [
+    {
+      "path": "/api/proactive",
+      "schedule": "*/15 * * * *"
+    }
+  ]
+}
