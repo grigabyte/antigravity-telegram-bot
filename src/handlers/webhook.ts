@@ -903,65 +903,97 @@ ${progressBar} ${contextStats.percent}%
 
     typingInterval = startTypingLoop(chatId);
 
-    const upperEventId = await resolveBatchUpperEventId(userId, chatId, enqueued.eventId);
-    const batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
+    let upperEventId = await resolveBatchUpperEventId(userId, chatId, enqueued.eventId);
+    let batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
     pendingBatchIds = batch.eventIds;
     if (batch.eventIds.length === 0) {
       if (typingInterval) clearInterval(typingInterval);
       return res.status(200).json({ ok: true });
     }
 
-    const batchHistoryText = batch.historyText || (text || 'Привет');
+    let finalResultText = '';
+    let finalResultSources: Array<{ title: string; url: string }> = [];
+    let finalBatchHistoryText = batch.historyText || (text || 'Привет');
+    let finalSignalCandidates: string[] = [];
+    let rebuildCount = 0;
+    const MAX_BATCH_REBUILDS = 2;
 
-    const signalCandidates = batch.parts
-      .filter((part) => typeof part.text === 'string' && part.text.includes('[Сигнал '))
-      .map((part) => part.text as string)
-      .slice(0, 5);
+    while (true) {
+      const batchHistoryText = batch.historyText || (text || 'Привет');
 
-    const retrievalStart = Date.now();
-    const memoryContext =
-      MEMORY_RETRIEVAL_MODE === 'supabase'
-        ? await buildSupabaseMemoryContext(userId, batchHistoryText)
-        : await buildMemoryRagContext(userId, batchHistoryText);
-    const retrievalLatency = Date.now() - retrievalStart;
-    await saveMetricSafe(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
-      mode: MEMORY_RETRIEVAL_MODE,
-      hasContext: Boolean(memoryContext),
-    });
+      const signalCandidates = batch.parts
+        .filter((part) => typeof part.text === 'string' && part.text.includes('[Сигнал '))
+        .map((part) => part.text as string)
+        .slice(0, 5);
 
-    if (memoryContext) {
-      await saveMetricSafe(userId, 'memory_retrieval_hit', 1, {
+      const retrievalStart = Date.now();
+      const memoryContext =
+        MEMORY_RETRIEVAL_MODE === 'supabase'
+          ? await buildSupabaseMemoryContext(userId, batchHistoryText)
+          : await buildMemoryRagContext(userId, batchHistoryText);
+      const retrievalLatency = Date.now() - retrievalStart;
+      await saveMetricSafe(userId, 'memory_retrieval_latency_ms', retrievalLatency, {
+        mode: MEMORY_RETRIEVAL_MODE,
+        hasContext: Boolean(memoryContext),
+      });
+
+      if (memoryContext) {
+        await saveMetricSafe(userId, 'memory_retrieval_hit', 1, {
+          mode: MEMORY_RETRIEVAL_MODE,
+        });
+      }
+
+      const partsForModel = memoryContext
+        ? [...batch.parts, { text: `[Релевантная память:${MEMORY_RETRIEVAL_MODE}]\n${memoryContext}` }]
+        : batch.parts;
+
+      const systemPrompt = await buildSystemPrompt(userId);
+      const contextBundle = await buildContextMessages(
+        userId,
+        { role: 'user', parts: partsForModel },
+        batchHistoryText
+      );
+      const modelStart = Date.now();
+      const result = await callGemini({
+        messages: contextBundle.messages,
+        systemPrompt,
+        forceSearch,
+      });
+      const modelLatency = Date.now() - modelStart;
+      await saveMetricSafe(userId, 'model_latency_ms', modelLatency, {
+        model: GEMINI_MODEL,
         mode: MEMORY_RETRIEVAL_MODE,
       });
+
+      const refreshedUpperEventId = await resolveBatchUpperEventId(userId, chatId, upperEventId);
+      const hasNewerEvents = refreshedUpperEventId > upperEventId;
+
+      if (hasNewerEvents && rebuildCount < MAX_BATCH_REBUILDS) {
+        upperEventId = refreshedUpperEventId;
+        batch = await buildInboundBatch(userId, chatId, upperEventId, BATCHING.pendingLimit);
+        pendingBatchIds = batch.eventIds;
+        rebuildCount += 1;
+
+        if (batch.eventIds.length === 0) {
+          if (typingInterval) clearInterval(typingInterval);
+          return res.status(200).json({ ok: true });
+        }
+
+        continue;
+      }
+
+      finalResultText = result.text;
+      finalResultSources = result.sources || [];
+      finalBatchHistoryText = batchHistoryText;
+      finalSignalCandidates = signalCandidates;
+      break;
     }
 
-    const partsForModel = memoryContext
-      ? [...batch.parts, { text: `[Релевантная память:${MEMORY_RETRIEVAL_MODE}]\n${memoryContext}` }]
-      : batch.parts;
-
-    const systemPrompt = await buildSystemPrompt(userId);
-    const contextBundle = await buildContextMessages(
-      userId,
-      { role: 'user', parts: partsForModel },
-      batchHistoryText
-    );
-    const modelStart = Date.now();
-    const result = await callGemini({
-      messages: contextBundle.messages,
-      systemPrompt,
-      forceSearch,
-    });
-    const modelLatency = Date.now() - modelStart;
-    await saveMetricSafe(userId, 'model_latency_ms', modelLatency, {
-      model: GEMINI_MODEL,
-      mode: MEMORY_RETRIEVAL_MODE,
-    });
-
-    let cleanText = result.text;
-    const memoryMatch = result.text.match(/<memory>([\s\S]*?)<\/memory>/i);
+    let cleanText = finalResultText;
+    const memoryMatch = finalResultText.match(/<memory>([\s\S]*?)<\/memory>/i);
     if (memoryMatch) {
       const memoryBlock = memoryMatch[1];
-      cleanText = result.text.replace(/<memory>[\s\S]*?<\/memory>/gi, '').trim();
+      cleanText = finalResultText.replace(/<memory>[\s\S]*?<\/memory>/gi, '').trim();
 
       const factMatch = memoryBlock.match(/FACT:\s*(.+)/gi);
       const prefMatch = memoryBlock.match(/PREF:\s*(.+)/gi);
@@ -984,15 +1016,15 @@ ${progressBar} ${contextStats.percent}%
       }
     }
 
-    if (result.sources && result.sources.length > 0) {
-      await saveLastSources(userId, result.sources);
+    if (finalResultSources.length > 0) {
+      await saveLastSources(userId, finalResultSources);
     }
 
     await finalizeInboundBatch(batch.eventIds);
     batchFinalized = true;
     pendingBatchIds = [];
 
-    for (const signalText of signalCandidates) {
+    for (const signalText of finalSignalCandidates) {
       await ingestMemoryFromText(userId, 'signal', signalText, {
         importance: 0.55,
         confidence: 0.6,
@@ -1003,20 +1035,20 @@ ${progressBar} ${contextStats.percent}%
 
     await addToHistory(userId, {
       role: 'user',
-      content: batchHistoryText,
+      content: finalBatchHistoryText,
       timestamp: Date.now(),
     });
 
     await addToHistory(userId, { role: 'model', content: cleanText, timestamp: Date.now() });
 
-    await ingestMemoryFromText(userId, 'episode', `${batchHistoryText}\n\nОтвет бота:\n${cleanText}`, {
+    await ingestMemoryFromText(userId, 'episode', `${finalBatchHistoryText}\n\nОтвет бота:\n${cleanText}`, {
       importance: 0.58,
       confidence: 0.7,
       sourceMessageId: batch.replyToMessageId,
       chunkMeta: { source: 'episode' },
     });
 
-    const shouldScheduleGoalFollowup = /цель|план|начну|сделаю|задач/i.test(batchHistoryText);
+    const shouldScheduleGoalFollowup = /цель|план|начну|сделаю|задач/i.test(finalBatchHistoryText);
     if (shouldScheduleGoalFollowup) {
       const hasPendingGoalFollowup = await hasPendingProactiveJob(userId, 'goal_followup');
       if (!hasPendingGoalFollowup) {
@@ -1054,10 +1086,10 @@ ${progressBar} ${contextStats.percent}%
       await sendTelegram(chatId, cleanText, batch.replyToMessageId, true, ttsButton);
     }
 
-    const fallbackSignal = inferOutboundSignal(cleanText, batchHistoryText);
+    const fallbackSignal = inferOutboundSignal(cleanText, finalBatchHistoryText);
     const outboundSignal: SignalPolicyDecision =
       OUTBOUND_SIGNAL_POLICY_MODE === 'llm'
-        ? await inferOutboundSignalWithLlm(cleanText, batchHistoryText, fallbackSignal)
+        ? await inferOutboundSignalWithLlm(cleanText, finalBatchHistoryText, fallbackSignal)
         : {
             kind: (fallbackSignal.intent === 'none' ? 'none' : 'reaction') as 'none' | 'reaction',
             emotion: fallbackSignal.emotion,
