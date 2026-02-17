@@ -133,26 +133,40 @@ export async function supabaseQuery(
 }
 
 export async function getHistory(userId: number, limit: number = MAX_HISTORY_MESSAGES): Promise<ChatMessage[]> {
-  let data: any[] | null = null;
+  const history: ChatMessage[] = [];
+  let offset = 0;
+  const pageSize = Number.isFinite(limit) && limit > 0 ? Math.max(1, Math.min(1000, Math.floor(limit))) : 1000;
+  const maxRows = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : Number.POSITIVE_INFINITY;
 
-  if (Number.isFinite(limit) && limit > 0) {
-    data = await supabaseQuery(
+  while (history.length < maxRows) {
+    const remaining = maxRows === Number.POSITIVE_INFINITY ? pageSize : Math.min(pageSize, maxRows - history.length);
+    const page = await supabaseQuery(
       'chat_history',
       'GET',
       null,
-      `?user_id=eq.${userId}&order=timestamp.desc&limit=${limit}`
+      `?user_id=eq.${userId}&order=timestamp.asc&limit=${remaining}&offset=${offset}`
     );
-    data = (data || []).sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
-  } else {
-    data = await supabaseQuery(
-      'chat_history',
-      'GET',
-      null,
-      `?user_id=eq.${userId}&order=timestamp.asc`
-    );
+
+    const rows = (page || []) as any[];
+    if (rows.length === 0) {
+      break;
+    }
+
+    for (const row of rows) {
+      history.push({
+        role: row.role as 'user' | 'model',
+        content: row.content,
+        timestamp: row.timestamp,
+      });
+    }
+
+    offset += rows.length;
+    if (rows.length < remaining) {
+      break;
+    }
   }
 
-  return (data || []).map((row: any) => ({
+  return history.map((row) => ({
     role: row.role as 'user' | 'model',
     content: row.content,
     timestamp: row.timestamp,
