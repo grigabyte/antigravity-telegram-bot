@@ -133,12 +133,25 @@ export async function supabaseQuery(
 }
 
 export async function getHistory(userId: number, limit: number = MAX_HISTORY_MESSAGES): Promise<ChatMessage[]> {
-  const data = await supabaseQuery(
-    'chat_history',
-    'GET',
-    null,
-    `?user_id=eq.${userId}&order=timestamp.asc&limit=${limit}`
-  );
+  let data: any[] | null = null;
+
+  if (Number.isFinite(limit) && limit > 0) {
+    data = await supabaseQuery(
+      'chat_history',
+      'GET',
+      null,
+      `?user_id=eq.${userId}&order=timestamp.desc&limit=${limit}`
+    );
+    data = (data || []).sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp));
+  } else {
+    data = await supabaseQuery(
+      'chat_history',
+      'GET',
+      null,
+      `?user_id=eq.${userId}&order=timestamp.asc`
+    );
+  }
+
   return (data || []).map((row: any) => ({
     role: row.role as 'user' | 'model',
     content: row.content,

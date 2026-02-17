@@ -1072,7 +1072,7 @@ ${progressBar} ${contextStats.percent}%
     }
 
     if (text === '/export') {
-      const history = await getHistory(userId);
+      const history = await getHistory(userId, Number.POSITIVE_INFINITY);
       const settings = await getUserSettings(userId);
       const memory = await getLongTermMemory(userId);
       const json = JSON.stringify({ history, insights: settings.insights, memory }, null, 2);
