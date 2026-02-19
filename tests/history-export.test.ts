@@ -22,7 +22,8 @@ test('export requests full history without default 500 limit', async () => {
     }
 
     if (url.includes('/rest/v1/chat_history') && init?.method === 'GET') {
-      assert.ok(!url.includes('limit=500'));
+      assert.ok(url.includes('limit=1000'));
+      assert.ok(url.includes('offset=0'));
       return jsonResponse([], 200);
     }
 

@@ -133,18 +133,33 @@ export async function supabaseQuery(
 }
 
 export async function getHistory(userId: number, limit: number = MAX_HISTORY_MESSAGES): Promise<ChatMessage[]> {
+  const normalizedLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : MAX_HISTORY_MESSAGES;
+  const data = await supabaseQuery(
+    'chat_history',
+    'GET',
+    null,
+    `?user_id=eq.${userId}&order=timestamp.desc&limit=${normalizedLimit}`
+  );
+  return ((data || []) as any[])
+    .sort((a: any, b: any) => Number(a.timestamp) - Number(b.timestamp))
+    .map((row: any) => ({
+    role: row.role as 'user' | 'model',
+    content: row.content,
+    timestamp: row.timestamp,
+    }));
+}
+
+export async function getFullHistoryPaged(userId: number, pageSize: number = 1000): Promise<ChatMessage[]> {
+  const normalizedPageSize = Math.max(100, Math.min(1000, Math.floor(pageSize)));
   const history: ChatMessage[] = [];
   let offset = 0;
-  const pageSize = Number.isFinite(limit) && limit > 0 ? Math.max(1, Math.min(1000, Math.floor(limit))) : 1000;
-  const maxRows = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : Number.POSITIVE_INFINITY;
 
-  while (history.length < maxRows) {
-    const remaining = maxRows === Number.POSITIVE_INFINITY ? pageSize : Math.min(pageSize, maxRows - history.length);
+  while (true) {
     const page = await supabaseQuery(
       'chat_history',
       'GET',
       null,
-      `?user_id=eq.${userId}&order=timestamp.asc&limit=${remaining}&offset=${offset}`
+      `?user_id=eq.${userId}&order=timestamp.asc&limit=${normalizedPageSize}&offset=${offset}`
     );
 
     const rows = (page || []) as any[];
@@ -161,16 +176,12 @@ export async function getHistory(userId: number, limit: number = MAX_HISTORY_MES
     }
 
     offset += rows.length;
-    if (rows.length < remaining) {
+    if (rows.length < normalizedPageSize) {
       break;
     }
   }
 
-  return history.map((row) => ({
-    role: row.role as 'user' | 'model',
-    content: row.content,
-    timestamp: row.timestamp,
-  }));
+  return history;
 }
 
 export async function getActiveHistory(
